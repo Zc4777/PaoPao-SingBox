@@ -1,6 +1,6 @@
 {
   "admin/services/paopaodns-rs": {
-    "title": "PaoPaoDNS-RS",
+    "title": "PaoPaoDNS-SingBox",
     "order": 65,
     "action": { "type": "firstchild" },
     "depends": {

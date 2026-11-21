@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 'use strict';
 
-import { lsdir, lstat, mkdir, mkdtemp, popen, readfile, rmdir, unlink, writefile } from 'fs';
+import { lstat, mkdir, mkdtemp, popen, readfile, rmdir, unlink, writefile } from 'fs';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
 
@@ -32,6 +32,24 @@ function instance() {
 
 function words(text) {
     return type(text) == 'string' && trim(text) ? split(trim(text), /[ ,\t\r\n]+/) : [];
+}
+
+function core_status() {
+    const running = instance()?.running == true;
+    let port = null;
+    try {
+        const profile = json(readfile(directory + '/config.json', max_size + 1) ?? '');
+        for (let entry in profile?.services ?? []) {
+            if (entry.type == 'api' && entry.dashboard?.enabled == true &&
+                type(entry.listen_port) == 'int' && entry.listen_port > 0 && entry.listen_port <= 65535) {
+                port = entry.listen_port;
+                break;
+            }
+        }
+    } catch (e) {
+        // The proxy can still report its runtime state without a readable profile.
+    }
+    return { running, dashboard_port: port };
 }
 
 function read_direct_clients() {
@@ -98,23 +116,6 @@ function write_direct_clients(values) {
 function editable(file) {
     return file == 'config.json' ||
         (type(file) == 'string' && match(file, /^(providers|rule-sets)\/[A-Za-z0-9_-]+\.json$/));
-}
-
-function list_files() {
-    const files = [ { file: 'config.json', title: 'sing-box 主配置', writable: true } ];
-    for (let folder in [ 'providers', 'rule-sets' ]) {
-        if (lstat(directory + '/' + folder)?.type != 'directory')
-            continue;
-        for (let name in sort(lsdir(directory + '/' + folder) ?? [])) {
-            const file = folder + '/' + name;
-            const info = lstat(directory + '/' + file);
-            if (editable(file) && info?.type == 'file')
-                push(files, { file, title: file, writable: true });
-        }
-    }
-    if (lstat(directory + '/momo-legacy.uci')?.type == 'file')
-        push(files, { file: 'momo-legacy.uci', title: '旧 Momo 配置（存档）', writable: false });
-    return { files };
 }
 
 function read_config(file) {
@@ -189,7 +190,7 @@ function read_logs(kind) {
 
 return {
     'luci.paopaodns.proxy': {
-        status: { call: () => ({ running: instance()?.running == true }) },
+        status: { call: core_status },
         readDirectClients: { call: read_direct_clients },
         writeDirectClients: {
             args: { addresses: [] },
@@ -204,7 +205,6 @@ return {
                 return run(init + ' control_core ' + action);
             }
         },
-        listFiles: { call: list_files },
         readConfig: {
             args: { file: '' },
             call: request => read_config(request.args.file || 'config.json')

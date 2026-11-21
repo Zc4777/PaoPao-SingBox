@@ -133,7 +133,7 @@ async fn forced_upstreams_cache_and_ipv6() {
 }
 
 #[tokio::test]
-async fn refreshes_hot_addresses_and_uses_bounded_stale_only_on_failure() {
+async fn refreshes_hot_and_expired_addresses_without_blocking_clients() {
     LocalSet::new().run_until(async {
         let (upstream, calls, status) = fake_upstream(Ipv4Addr::new(8, 8, 4, 4)).await;
         let config = Config::parse_from(["test", "--recursive", &upstream.to_string(), "--recursive-only"]);
@@ -166,6 +166,22 @@ async fn refreshes_hot_addresses_and_uses_bounded_stale_only_on_failure() {
         assert_eq!(*calls.borrow(), 2);
         assert!(resolve().await.answers[0].ttl >= 59);
 
+        server.cache.borrow_mut().set_entry_age(key, Duration::from_secs(61));
+        for _ in 0..2 {
+            assert_eq!(resolve().await.answers[0].ttl, 5);
+        }
+        assert_eq!(*calls.borrow(), 2);
+        let wait_for_refresh = || async {
+            timeout(Duration::from_secs(1), async {
+                while server.prefetch_slots.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+        };
+        wait_for_refresh().await;
+        assert_eq!(*calls.borrow(), 3);
+        assert!(resolve().await.answers[0].ttl >= 59);
+
         status.set(ResponseCode::ServFail);
         server.cache.borrow_mut().set_entry_age(key, Duration::from_secs(61));
         for _ in 0..2 {
@@ -174,6 +190,11 @@ async fn refreshes_hot_addresses_and_uses_bounded_stale_only_on_failure() {
             assert_eq!(stale.answers[0].ttl, 5);
         }
         assert_eq!(*calls.borrow(), 3);
+        wait_for_refresh().await;
+        assert_eq!(*calls.borrow(), 4);
+        assert_eq!(resolve().await.answers[0].ttl, 5);
+        assert_eq!(server.prefetch_slots.available_permits(), 1);
+
         server.cache.borrow_mut().set_entry_age(key, Duration::from_secs(361));
         assert_eq!(resolve().await.metadata.response_code, ResponseCode::ServFail);
 
@@ -181,7 +202,8 @@ async fn refreshes_hot_addresses_and_uses_bounded_stale_only_on_failure() {
         resolve().await;
         server.cache.borrow_mut().set_entry_age(key, Duration::from_secs(61));
         status.set(ResponseCode::NXDomain);
-        assert_eq!(resolve().await.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(resolve().await.answers[0].ttl, 5);
+        wait_for_refresh().await;
         status.set(ResponseCode::ServFail);
         assert_eq!(resolve().await.metadata.response_code, ResponseCode::ServFail);
     }).await;
@@ -203,6 +225,7 @@ fn local_and_fake_addresses_are_ineligible_for_stale_cache() {
         cache.set_entry_age(key, Duration::from_secs(56));
         assert!(!cache.get(key, 41, true).unwrap().prefetch);
         cache.set_entry_age(key, Duration::from_secs(61));
+        assert!(cache.get(key, 41, true).is_none());
         assert!(cache.stale_after_failure(key, 41).is_none());
     }
 }
@@ -283,7 +306,21 @@ fn persistent_cache_respects_ttl_and_policy() {
     assert_eq!(reply.metadata.id, 22);
     assert!((1..=5).contains(&reply.answers[0].ttl));
 
-    data[saved_at].copy_from_slice(&(saved - 60).to_be_bytes());
+    // Save an already expired record and verify its age survives a restart.
+    cache.insert(key, &answer, true);
+    cache.set_entry_age(key, Duration::from_secs(20));
+    cache.save(&path, config.recursive, 4096).unwrap();
+    let mut data = std::fs::read(&path).unwrap();
+    let saved = u64::from_be_bytes(data[saved_at.clone()].try_into().unwrap());
+    let mut optimistic = Cache::new(16, 8);
+    assert_eq!(optimistic.restore(&path, &config, 4096, |_, _| true).unwrap(), 1);
+    assert!(optimistic.get(key, 22, false).is_none());
+    let hit = optimistic.get(key, 22, true).unwrap();
+    assert_eq!(hit.source, "optimistic-cache");
+    assert!(hit.prefetch);
+    assert_eq!(Message::from_vec(&hit.bytes).unwrap().answers[0].ttl, 5);
+
+    data[saved_at].copy_from_slice(&(saved - 290).to_be_bytes());
     std::fs::write(&path, &data).unwrap();
     let mut expired = Cache::new(16, 8);
     assert_eq!(expired.restore(&path, &config, 4096, |_, _| true).unwrap(), 0);
@@ -326,7 +363,7 @@ fn legacy_cache_migrates_and_rule_changes_only_discard_affected_entries() {
     let mut migrated = Cache::new(16, 600);
     assert_eq!(migrated.restore(&path, &config, 4096, |q, a| can_restore_recursive(&config, &rules, q, a)).unwrap(), 2);
     migrated.save(&path, config.recursive, 4096).unwrap();
-    assert!(std::fs::read(&path).unwrap().starts_with(b"PPDNS002"));
+    assert!(std::fs::read(&path).unwrap().starts_with(b"PPDNS003"));
 
     let rule_file = directory.join("force_forward_list.txt");
     std::fs::write(&rule_file, "full:changed.example\n").unwrap();

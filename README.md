@@ -1,4 +1,4 @@
-# PaoPao-SingBox
+# PaoPaoDNS-SingBox
 
 面向 OpenWrt 的 DNS 分流与 Fake-IP 透明代理。LuCI 同时管理 Rust 编写的 PaoPaoDNS-RS 和路由器上的 sing-box。
 
@@ -55,19 +55,20 @@ find bin/packages -type f -name 'paopaodns-rs*'
 
 ## LuCI
 
-安装新版后端和 `luci-app-paopaodns-rs` 后，进入 **服务 → PaoPaoDNS-RS**。
+安装新版后端和 `luci-app-paopaodns-rs` 后，进入 **服务 → PaoPaoDNS-SingBox**。
 
 - 「启动」「停止」「重启」控制当前运行状态，「开机自动启动」控制以后开机时是否启动。
 - 进程内存上限使用 Linux 的 `RLIMIT_AS`，单位 MiB。填 0 表示不限。保存并应用后，运行中的进程会以新的上限重新启动。页面同时显示实测 RSS 和生效的虚拟内存上限。
 - 规则编辑器管理默认规则目录下的三个 `force_*_list.txt`，单个文件最大 64 KiB。保存前校验规则，服务正在运行时重新加载。
 
 - 「自定义上游（Fake-IP）」填 sing-box 或 Clash 的 DNS 监听地址和端口。填写后自动转发已判定为非 CN 的 A/AAAA 查询与 force_forward_list.txt 指定的域名。留空关闭自定义转发。Fake-IP 地址由该上游生成。IPv4 与 IPv6 开关控制对该上游的 A 和 AAAA 查询，默认仅 IPv4。
+- 主页可启停 sing-box，并在启用控制面板时直接打开面板。
 - 「更新分流数据」检查 CN 地址库和 PaoPao-Pref 域名标记，下载并校验变更的数据。更新完成后重新加载分流配置。手动指定的自定义数据路径由用户维护。
 - 客户端查询与服务日志各显示最近 500 条，当前页签每 3 秒刷新。服务重启后显示本次运行日志，启动时记录从磁盘加载的缓存数量。
-- 缓存文件 /etc/paopaodns-rs/cache.bin 一直启用，默认上限 4 MiB。常规正向结果每分钟及正常退出时保存。重启时按剩余有效期和当前规则逐条恢复缓存。更换递归上游后重新查询。Fake-IP 分流回答留在内存缓存。常用的公网 A／AAAA 答案到期前 10% 可由查询触发一次后台刷新。主递归上游的公网答案可在解析失败时提供 5 分钟以内的过期兜底，回复 TTL 最长 5 秒。
+- 缓存文件 /etc/paopaodns-rs/cache.bin 一直启用，默认上限 4 MiB。常规正向结果每分钟及正常退出时保存。重启时按剩余有效期和当前规则逐条恢复缓存。更换递归上游后重新查询。Fake-IP 分流回答留在内存缓存。主递归上游的公网 A／AAAA 答案支持乐观缓存。过期不超过 5 分钟时，客户端先收到 TTL 最长 5 秒的旧答案，同时后台刷新。磁盘缓存保留原始年龄，重启后沿用同一个过期窗口。
 - 「平均 DNS 响应时间」统计本次服务启动以来所有已回复请求，从收到完整请求到交给系统发送。
 
-- 「代理编辑器」使用路由器已有的 `/usr/bin/sing-box`。保存 `/etc/paopaodns-rs/proxy/config.json` 或已存在的本地 JSON 节点、规则文件时先校验，启动失败会恢复上一份配置。主配置从本地文件读取。节点、规则集和面板由 sing-box 按配置加载。本地节点和规则文件可放在 `/etc/paopaodns-rs/proxy/providers/`、`rule-sets/` 文件。
+- 「代理编辑器」使用路由器已有的 `/usr/bin/sing-box`。保存 `/etc/paopaodns-rs/proxy/config.json` 时先校验，启动失败会恢复上一份配置。主配置从本地文件读取。节点、规则集和面板由 sing-box 按配置加载。本地节点和规则文件可放在 `/etc/paopaodns-rs/proxy/providers/`、`rule-sets/` 文件。
 - 集成代理的 DNS 入站为 `127.0.0.1:1020`，PaoPaoDNS-RS 通过「自定义上游」转发至此。「局域网代理」管理不代理的客户端 IP。名单中的客户端保留原 DNS 服务器和路由。其余 LAN 客户端发往 `7.0.0.0/8` 与 `fc00::/18` 的 TCP/UDP 进入透明代理。日志页可查看代理服务和当前核心日志。核心缓存使用同目录的 `cache.db`。
 
 从 SDK 构建页面时，同时更新 `luci` feed、安装其 `luci-base` 定义，再将 `openwrt/luci-app-paopaodns-rs` 复制到 SDK 的 `package/`。将 `CONFIG_PACKAGE_luci-app-paopaodns-rs=m` 加入 `.config`，然后构建 `package/luci-app-paopaodns-rs/compile`。

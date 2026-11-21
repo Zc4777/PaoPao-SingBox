@@ -32,19 +32,30 @@ pub struct CacheHit {
 
 struct Entry {
     inserted: Instant,
+    age_at_insert: Duration,
     ttl: Duration,
     message: Message,
     persistent: bool,
     restored: bool,
     refreshable: bool,
-    prefetched: bool,
+    refreshing: bool,
     retry_after: Option<Instant>,
 }
 
 impl Entry {
-    fn prefetch_due(&self, elapsed: Duration) -> bool {
-        self.refreshable && !self.prefetched && self.ttl >= MIN_PREFETCH_TTL
-            && elapsed < self.ttl && self.ttl - elapsed <= self.ttl / 10
+    fn age(&self) -> Duration {
+        self.age_at_insert + self.inserted.elapsed()
+    }
+
+    fn prefetch_due(&self, elapsed: Duration, now: Instant) -> bool {
+        self.refreshable
+            && !self.refreshing
+            && self.retry_after.is_none_or(|retry| now >= retry)
+            && if elapsed >= self.ttl {
+                elapsed < self.ttl + MAX_STALE_AGE
+            } else {
+                self.ttl >= MIN_PREFETCH_TTL && self.ttl - elapsed <= self.ttl / 10
+            }
     }
 
     fn stale_answer(&self, id: u16, elapsed: Duration) -> Option<CacheHit> {
@@ -100,15 +111,19 @@ impl Cache {
         let items = self.items.as_mut()?;
         let entry = items.get(key)?;
         let now = Instant::now();
-        let elapsed = now.duration_since(entry.inserted);
+        let elapsed = entry.age();
         if elapsed >= entry.ttl {
             if !entry.refreshable || elapsed >= entry.ttl + MAX_STALE_AGE {
                 items.pop(key);
                 return None;
             }
-            return (allow_stale && entry.retry_after.is_some_and(|retry| now < retry))
-                .then(|| entry.stale_answer(id, elapsed))
-                .flatten();
+            if !allow_stale {
+                return None;
+            }
+            let mut hit = entry.stale_answer(id, elapsed)?;
+            hit.source = "optimistic-cache";
+            hit.prefetch = entry.prefetch_due(elapsed, now);
+            return Some(hit);
         }
         let mut reply = entry.message.clone();
         reply.metadata.id = id;
@@ -116,30 +131,37 @@ impl Cache {
         Some(CacheHit {
             bytes: reply.to_vec().ok()?,
             source: if entry.restored { "disk-cache" } else { "cache" },
-            prefetch: entry.prefetch_due(elapsed),
+            prefetch: entry.prefetch_due(elapsed, now),
         })
     }
 
     pub fn stale_after_failure(&mut self, key: &[u8], id: u16) -> Option<CacheHit> {
         let entry = self.items.as_mut()?.get_mut(key)?;
         let now = Instant::now();
-        let answer = entry.stale_answer(id, now.duration_since(entry.inserted))?;
+        let answer = entry.stale_answer(id, entry.age())?;
         entry.retry_after = Some(now + STALE_REPLY_TTL);
         Some(answer)
     }
 
     pub fn begin_prefetch(&mut self, key: &[u8]) -> Option<Instant> {
         let entry = self.items.as_mut()?.get_mut(key)?;
-        if !entry.prefetch_due(entry.inserted.elapsed()) {
+        if !entry.prefetch_due(entry.age(), Instant::now()) {
             return None;
         }
-        entry.prefetched = true;
+        entry.refreshing = true;
         Some(entry.inserted)
     }
 
-    pub fn prefetch_is_current(&self, key: &[u8], started: Instant) -> bool {
-        self.items.as_ref().and_then(|items| items.peek(key))
-            .is_some_and(|entry| entry.inserted == started)
+    pub fn finish_prefetch(&mut self, key: &[u8], started: Instant, failed: bool) -> bool {
+        let Some(entry) = self.items.as_mut().and_then(|items| items.peek_mut(key))
+            .filter(|entry| entry.inserted == started) else {
+                return false;
+            };
+        entry.refreshing = false;
+        if failed {
+            entry.retry_after = Some(Instant::now() + STALE_REPLY_TTL);
+        }
+        true
     }
 
     pub fn invalidate(&mut self, key: &[u8]) {
@@ -151,16 +173,16 @@ impl Cache {
     pub fn insert(&mut self, key: &[u8], answer: &Answer, persistent: bool) {
         self.invalidate(key);
         if answer.bytes.len() <= MAX_QUERY_SIZE {
-            self.put(key.to_vec(), answer.message.clone(), persistent, false);
+            self.put(key.to_vec(), answer.message.clone(), persistent, Duration::ZERO, false);
         }
     }
 
     #[cfg(test)]
     pub fn set_entry_age(&mut self, key: &[u8], age: Duration) {
-        self.items.as_mut().unwrap().get_mut(key).unwrap().inserted = Instant::now() - age;
+        self.items.as_mut().unwrap().get_mut(key).unwrap().age_at_insert = age;
     }
 
-    fn put(&mut self, key: Vec<u8>, message: Message, persistent: bool, restored: bool) {
+    fn put(&mut self, key: Vec<u8>, message: Message, persistent: bool, age: Duration, restored: bool) {
         let Some(items) = &mut self.items else { return };
         if message.metadata.message_type != hickory_proto::op::MessageType::Response
             || message.metadata.response_code != ResponseCode::NoError
@@ -182,17 +204,21 @@ impl Cache {
             .min()
             .unwrap_or_default()
             .min(self.max_ttl);
-        if ttl > 0 {
+        let ttl = Duration::from_secs(u64::from(ttl));
+        let refreshable = persistent && is_public_address_reply(&message);
+        let max_age = if refreshable { ttl + MAX_STALE_AGE } else { ttl };
+        if !ttl.is_zero() && age < max_age {
             items.put(
                 key,
                 Entry {
                     inserted: Instant::now(),
-                    ttl: Duration::from_secs(u64::from(ttl)),
-                    refreshable: persistent && is_public_address_reply(&message),
+                    ttl,
+                    age_at_insert: age,
+                    refreshable,
                     message,
                     persistent,
                     restored,
-                    prefetched: false,
+                    refreshing: false,
                     retry_after: None,
                 },
             );
@@ -232,9 +258,10 @@ impl Cache {
     ) -> io::Result<usize> {
         let (magic, mut input) = bytes.split_at_checked(8).ok_or_else(invalid_snapshot)?;
         let legacy = magic == LEGACY_MAGIC;
+        let stores_age = magic == MAGIC;
         let legacy_stamp = if legacy {
             Some(take_u64(&mut input).ok_or_else(invalid_snapshot)?)
-        } else if magic == MAGIC {
+        } else if stores_age || magic == PREVIOUS_MAGIC {
             let upstream = take_packet(&mut input)
                 .and_then(|bytes| std::str::from_utf8(bytes).ok())
                 .and_then(|addr| addr.parse::<SocketAddr>().ok())
@@ -250,7 +277,7 @@ impl Cache {
         let Some(age) = unix_time()?.checked_sub(saved_at) else {
             return Ok(0);
         };
-        if age >= u64::from(self.max_ttl)
+        if age >= u64::from(self.max_ttl) + MAX_STALE_AGE.as_secs()
             || legacy_stamp.is_some_and(|stamp| stamp != legacy_policy_stamp(config))
         {
             return Ok(0);
@@ -258,8 +285,9 @@ impl Cache {
         let persistent = !legacy || config.cn_fallback.is_none();
         let mut records = Vec::new();
         while !input.is_empty() {
-            let Some((key, bytes)) = take_packet(&mut input)
+            let Some(((key, bytes), age_at_snapshot)) = take_packet(&mut input)
                 .and_then(|key| take_packet(&mut input).map(|bytes| (key, bytes)))
+                .zip(if stores_age { take_u32(&mut input) } else { Some(0) })
             else {
                 if oversized {
                     break;
@@ -272,15 +300,16 @@ impl Cache {
                     && (legacy || accepts(&query, &answer))
                     && let Some(key) = self.key(&query, key)
                 {
-                    records.push((key.to_vec(), age_records(answer, age as u32)));
+                    let elapsed = Duration::from_secs(age + u64::from(age_at_snapshot));
+                    records.push((key.to_vec(), answer, elapsed));
                 }
             }
         }
-        for (key, reply) in records.into_iter().rev() {
-            self.put(key, reply, persistent, true);
+        for (key, reply, elapsed) in records.into_iter().rev() {
+            self.put(key, reply, persistent, elapsed, true);
         }
         let restored = self.items.as_ref().map_or(0, LruCache::len);
-        if legacy && persistent && restored > 0 {
+        if !stores_age && persistent && restored > 0 {
             self.dirty = true;
         }
         Ok(restored)
@@ -298,32 +327,34 @@ impl Cache {
         append_packet(&mut data, upstream.to_string().as_bytes());
         data.extend_from_slice(&unix_time()?.to_be_bytes());
         for (key, entry) in items.iter() {
-            let elapsed = entry.inserted.elapsed();
+            let elapsed = entry.age();
             let age = elapsed.as_secs() + u64::from(elapsed.subsec_nanos() > 0);
-            if !entry.persistent || age >= entry.ttl.as_secs() {
+            let max_age = if entry.refreshable { entry.ttl + MAX_STALE_AGE } else { entry.ttl };
+            if !entry.persistent || age >= max_age.as_secs() {
                 continue;
             }
-            let mut reply = age_records(entry.message.clone(), age as u32);
-            let remaining = (entry.ttl.as_secs() - age) as u32;
+            let mut reply = entry.message.clone();
+            let ttl = entry.ttl.as_secs() as u32;
             for record in reply
                 .answers
                 .iter_mut()
                 .chain(&mut reply.authorities)
                 .chain(&mut reply.additionals)
             {
-                record.ttl = record.ttl.min(remaining);
+                record.ttl = record.ttl.min(ttl);
             }
             let Ok(reply) = reply.to_vec() else { continue };
             if reply.len() > MAX_QUERY_SIZE {
                 continue;
             }
-            if data.len() + key.len() + reply.len() + 6 > max_bytes {
+            if data.len() + key.len() + reply.len() + 10 > max_bytes {
                 break;
             }
             data.extend_from_slice(&((key.len() + 2) as u16).to_be_bytes());
             data.extend_from_slice(&[0, 0]);
             data.extend_from_slice(key);
             append_packet(&mut data, &reply);
+            data.extend_from_slice(&(age as u32).to_be_bytes());
         }
         atomic_write(path, &data, true)?;
         self.dirty = false;
@@ -332,7 +363,8 @@ impl Cache {
 }
 
 const LEGACY_MAGIC: &[u8; 8] = b"PPDNS001";
-const MAGIC: &[u8; 8] = b"PPDNS002";
+const PREVIOUS_MAGIC: &[u8; 8] = b"PPDNS002";
+const MAGIC: &[u8; 8] = b"PPDNS003";
 
 pub(crate) fn legacy_policy_stamp(config: &Config) -> u64 {
     let mut hash = DefaultHasher::new();
@@ -417,6 +449,12 @@ fn unix_time() -> io::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
         .map_err(io::Error::other)
+}
+
+fn take_u32(input: &mut &[u8]) -> Option<u32> {
+    let (head, tail) = input.split_at_checked(4)?;
+    *input = tail;
+    Some(u32::from_be_bytes(head.try_into().ok()?))
 }
 
 fn take_u64(input: &mut &[u8]) -> Option<u64> {

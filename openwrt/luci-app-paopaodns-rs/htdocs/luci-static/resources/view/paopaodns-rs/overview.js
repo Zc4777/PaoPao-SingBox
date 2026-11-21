@@ -43,6 +43,7 @@ function checkReply(reply) {
 function renderService(writable) {
     const label = E('p', { role: 'status' });
     const latencyLabel = E('p', {});
+    const core = renderCore(writable);
     const updateLabel = E('span', {
         role: 'status',
         hidden: '',
@@ -123,39 +124,50 @@ function renderService(writable) {
     poll.add(refresh, 3);
 
     return E('section', { class: 'cbi-section' }, [
-        E('h2', {}, [ 'PaoPaoDNS-RS' ]),
+        E('h2', {}, [ 'PaoPaoDNS-SingBox' ]),
         E('div', { class: 'cbi-section-node' }, [
-            label, latencyLabel, E('div', {
+            label, latencyLabel, core.label, E('div', {
                 class: 'control-group',
                 style: 'display:flex;align-items:center;flex-wrap:wrap;gap:.5rem'
-            }, [ start, stop, restart, updateData, updateLabel ])
+            }, [ start, stop, restart, updateData, ...core.controls, updateLabel ])
         ])
     ]);
 }
 
 function renderCore(writable) {
     const label = E('p', { role: 'status' });
+    const dashboard = E('a', {
+        class: 'btn cbi-button cbi-button-action', target: '_blank', rel: 'noopener noreferrer', hidden: ''
+    }, [ '打开 sing-box 监控面板' ]);
     let pending = false;
     let running;
+    let dashboardPort;
 
     function update() {
-        label.textContent = running == null ? '正在读取状态…' : running ? '运行中' : '已停止';
+        label.textContent = 'sing-box · ' + (running == null ? '状态未知' : running ? '运行中' : '已停止');
         start.disabled = !writable || pending || running !== false;
         stop.disabled = !writable || pending || running !== true;
+        dashboard.hidden = !running || !Number.isInteger(dashboardPort);
+        if (dashboard.hidden) {
+            dashboard.removeAttribute('href');
+        } else {
+            const url = new URL('/dashboard/', window.location.href);
+            url.protocol = 'http:';
+            url.port = dashboardPort;
+            dashboard.href = url.href;
+        }
     }
 
     async function refresh() {
         try {
             const state = await callCoreStatus();
             running = typeof state.running === 'boolean' ? state.running : null;
-            update();
-            if (running == null)
-                label.textContent = '无法读取核心状态';
+            dashboardPort = state.dashboard_port;
         } catch (e) {
             running = null;
-            update();
-            label.textContent = '无法读取核心状态';
+            dashboardPort = null;
         }
+        update();
     }
 
     async function control(action) {
@@ -178,13 +190,7 @@ function renderCore(writable) {
     update();
     void refresh();
     poll.add(refresh, 3);
-
-    return E('section', { class: 'cbi-section' }, [
-        E('h3', {}, [ 'sing-box' ]),
-        E('div', { class: 'cbi-section-node' }, [
-            label, E('div', { class: 'control-group' }, [ start, ' ', stop ])
-        ])
-    ]);
+    return { label, controls: [ start, stop, dashboard ] };
 }
 
 function createSettings() {
@@ -257,7 +263,7 @@ return view.extend({
     render: function() {
         const writable = L.hasViewPermission();
         return createSettings().render().then(node => E('div', {}, [
-            renderService(writable), renderCore(writable), node
+            renderService(writable), node
         ]));
     }
 });

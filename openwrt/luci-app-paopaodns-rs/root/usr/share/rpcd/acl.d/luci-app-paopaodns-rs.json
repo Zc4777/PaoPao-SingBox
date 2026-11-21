@@ -13,6 +13,6 @@
   "luci-app-paopaodns-rs-proxy": {
     "description": "Edit local sing-box configuration, including credentials",
     "read": { "ubus": { "luci.paopaodns.proxy": [ "status", "readDirectClients" ] } },
-    "write": { "ubus": { "luci.paopaodns.proxy": [ "listFiles", "readConfig", "writeConfig", "writeDirectClients" ] } }
+    "write": { "ubus": { "luci.paopaodns.proxy": [ "readConfig", "writeConfig", "writeDirectClients" ] } }
   }
 }

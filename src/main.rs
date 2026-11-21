@@ -167,7 +167,7 @@ impl Server {
             let _permit = permit;
             let result = server.resolve(&request).await;
             let mut cache = server.cache.borrow_mut();
-            if cache.prefetch_is_current(&key, started) {
+            if cache.finish_prefetch(&key, started, resolution_failed(&result)) {
                 server.remember_answer(&mut cache, &key, &result);
             }
         });
