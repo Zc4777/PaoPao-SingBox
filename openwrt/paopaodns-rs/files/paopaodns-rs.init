@@ -1,0 +1,170 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-3.0-only
+
+START=75
+USE_PROCD=1
+
+extra_command "check_config" "Validate settings and rule files"
+extra_command "refresh_lan" "Refresh the LAN DNS redirect"
+
+with_service_config() {
+	local callback="$1"
+	local limit rules_dir flag var value mmdb
+	config_load paopaodns-rs
+	config_get limit main memory_limit_mib 0
+	config_get rules_dir main rules_dir /etc/paopaodns-rs
+	case "$limit" in
+		0) ;;
+		[1-9][0-9]|[1-9][0-9][0-9]|[1-4][0-9][0-9][0-9])
+			[ "$limit" -ge 32 ] && [ "$limit" -le 4096 ] || {
+				echo "memory_limit_mib must be 0 or 32-4096" >&2
+				return 1
+			}
+			;;
+		*)
+			echo "memory_limit_mib must be 0 or 32-4096" >&2
+			return 1
+			;;
+	esac
+
+	set -- /usr/sbin/paopaodns-rs --listen '[::]:5354' --rules-dir "$rules_dir" \
+		--stats-file /var/run/paopaodns-rs-stats.json --log-queries
+	config_get mmdb main mmdb
+	if [ -z "$mmdb" ] && [ -r /etc/paopaodns-rs/Country-only-cn-private.mmdb ]; then
+		mmdb=/etc/paopaodns-rs/Country-only-cn-private.mmdb
+	fi
+	[ -z "$mmdb" ] || set -- "$@" --mmdb "$mmdb"
+	set -- "$@" --cache-file /etc/paopaodns-rs/cache.bin
+	for var in recursive encrypted custom_forward custom_ip cn_fallback cache_max_ttl \
+		cache_file_mib timeout_ms concurrency ipv6 global_mark cn_mark
+	do
+		config_get value main "$var" ""
+		[ -n "$value" ] || continue
+		flag="$(printf '%s' "$var" | tr '_' '-')"
+		set -- "$@" "--$flag" "$value"
+	done
+	for var in recursive_only allow_service_records
+	do
+		config_get_bool value main "$var" 0
+		[ "$value" -eq 1 ] || continue
+		flag="$(printf '%s' "$var" | tr '_' '-')"
+		set -- "$@" "--$flag"
+	done
+	"$callback" "$limit" "$rules_dir" "$@"
+}
+
+check_command() {
+	local limit="$1"
+	shift 2
+	(
+		if [ "$limit" -ne 0 ]; then
+			ulimit -v "$((limit * 1024))" || exit 1
+		fi
+		"$@" --check
+	)
+}
+
+check_config() {
+	with_service_config check_command
+}
+
+set_dns_firewall() {
+	local mode="$1" lan
+	lan="$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e '@.l3_device')"
+	case "$lan" in
+		''|*[!a-zA-Z0-9_.:-]*)
+			[ "$mode" != active ] || {
+				echo 'Unable to resolve the LAN interface for DNS redirect' >&2
+				return 1
+			}
+			lan=
+			;;
+	esac
+	{
+		cat <<'NFT'
+add table inet paopaodns_rs
+delete table inet paopaodns_rs
+table inet paopaodns_rs {
+	chain input {
+		type filter hook input priority -5; policy accept;
+		iifname "lo" return
+NFT
+		[ -z "$lan" ] || printf '\t\tiifname "%s" return\n' "$lan"
+		echo '		meta l4proto { tcp, udp } th dport 5354 drop'
+		echo '	}'
+		if [ "$mode" = active ]; then
+			cat <<NFT
+	chain dstnat {
+		type nat hook prerouting priority -101; policy accept;
+		iifname "$lan" meta l4proto { tcp, udp } th dport 53 counter redirect to :5354
+	}
+NFT
+		fi
+		echo '}'
+	} | nft -f -
+}
+
+register_command() {
+	local limit="$1" rules_dir="$2" bytes mmdb
+	check_command "$@" || return 1
+	set_dns_firewall active || return 1
+	config_get mmdb main mmdb /etc/paopaodns-rs/Country-only-cn-private.mmdb
+	shift 2
+
+	procd_open_instance main
+	procd_set_param command "$@"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file /etc/config/paopaodns-rs \
+		"$rules_dir/force_forward_list.txt" \
+		"$rules_dir/force_dnscrypt_list.txt" \
+		"$rules_dir/force_recurse_list.txt" "$mmdb"
+	if [ "$limit" -ne 0 ]; then
+		bytes="$((limit * 1048576))"
+		procd_set_param limits "as=$bytes $bytes"
+	fi
+	procd_close_instance
+}
+
+start_service() {
+	local enabled
+	config_load paopaodns-rs
+	config_get_bool enabled main enabled 1
+	[ "$enabled" -eq 1 ] || [ "$PAOPAODNS_MANUAL_START" = 1 ] || return 0
+	with_service_config register_command
+}
+
+service_started() {
+	[ "$(uci -q get firewall.paopaodns_rs_dns)" = redirect ] || return 0
+	[ "$(uci -q get firewall.paopaodns_rs_dns.name)" = 'PaoPaoDNS-RS LAN DNS' ] || return 0
+	[ "$(uci -q get firewall.paopaodns_rs_dns.src)" = lan ] || return 0
+	[ -z "$(uci changes firewall)" ] || return 0
+	nft list chain inet paopaodns_rs dstnat >/dev/null 2>&1 || return 0
+	uci -q delete firewall.paopaodns_rs_dns && uci commit firewall &&
+		/etc/init.d/firewall reload
+}
+
+stop_service() {
+	set_dns_firewall guard
+	rm -f /var/run/paopaodns-rs-stats.json
+}
+
+reload_service() {
+	running || return 0
+	check_config || return 1
+	PAOPAODNS_MANUAL_START=1 start
+}
+
+refresh_lan() {
+	if running; then
+		set_dns_firewall active || set_dns_firewall guard
+	else
+		/etc/init.d/paopaodns-rs start
+	fi
+}
+
+service_triggers() {
+	procd_add_reload_trigger paopaodns-rs
+	procd_add_interface_trigger "interface.*" lan /etc/init.d/paopaodns-rs refresh_lan
+}

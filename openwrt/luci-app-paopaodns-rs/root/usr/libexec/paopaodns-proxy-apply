@@ -1,0 +1,75 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+set -u
+
+directory=/etc/paopaodns-rs/proxy
+init=/etc/init.d/paopaodns-proxy
+stage="$1"
+file="$2"
+
+case "$stage" in
+    "$directory"/.luci.??????/config.json) ;;
+    *) exit 1;;
+esac
+case "$file" in
+    config.json) ;;
+    providers/*.json|rule-sets/*.json)
+        name="$(basename "$file")"
+        case "$name" in *[!a-zA-Z0-9_.-]*) exit 1;; esac
+        case "$file" in "providers/$name"|"rule-sets/$name") ;; *) exit 1;; esac
+        [ -f "$directory/$file" ] && [ ! -L "$directory/$file" ] || exit 1
+        ;;
+    *) exit 1;;
+esac
+destination="$directory/$file"
+
+# Serialize config replacement and rollback from simultaneous LuCI sessions.
+exec 9>"$directory/.config.lock"
+flock -n 9 || { echo '已有配置正在应用'; exit 1; }
+backup="$stage.previous"
+umask 077
+
+if [ "$file" = config.json ]; then
+    /usr/libexec/paopaodns-proxy-check "$stage" || exit 1
+fi
+chmod 600 "$stage" || exit 1
+if [ -e "$destination" ]; then
+    cp -p "$destination" "$backup" || exit 1
+fi
+
+old_enabled="$(uci -q get paopaodns-proxy.main.enabled)"
+was_running=0
+"$init" running && was_running=1
+if [ "$file" != config.json ] && [ "$was_running" = 1 ]; then
+    "$init" stop || { rm -f "$backup"; exit 1; }
+fi
+
+touch /etc/config/paopaodns-proxy
+if mv -f "$stage" "$destination" &&
+    uci set paopaodns-proxy.main=proxy &&
+    uci set paopaodns-proxy.main.enabled=1 &&
+    uci commit paopaodns-proxy &&
+    "$init" restart && "$init" wait_core; then
+    "$init" enable
+    rm -f "$backup"
+    echo '代理配置已保存并生效。'
+    exit 0
+fi
+
+"$init" stop >/dev/null 2>&1
+if [ -f "$backup" ]; then
+    mv -f "$backup" "$destination" || exit 1
+else
+    rm -f "$destination"
+fi
+if [ -n "$old_enabled" ]; then
+    uci set "paopaodns-proxy.main.enabled=$old_enabled"
+else
+    uci -q delete paopaodns-proxy.main.enabled || :
+fi
+uci commit paopaodns-proxy
+if [ "$was_running" -eq 1 ]; then
+    "$init" start >/dev/null 2>&1
+fi
+echo '代理启动失败，已恢复上一份配置。请检查核心日志。'
+exit 1

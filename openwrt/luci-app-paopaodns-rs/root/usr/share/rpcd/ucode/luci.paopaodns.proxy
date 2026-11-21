@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: GPL-3.0-only
+'use strict';
+
+import { lsdir, lstat, mkdir, mkdtemp, popen, readfile, rmdir, unlink, writefile } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+
+const service = 'paopaodns-proxy';
+const init = '/etc/init.d/' + service;
+const directory = '/etc/paopaodns-rs/proxy';
+const max_size = 256 * 1024;
+function error(message) {
+    return { ok: false, error: message };
+}
+
+function run(command) {
+    const stream = popen(command + ' 2>&1');
+    if (!stream)
+        return error('无法执行请求');
+    const text = trim(stream.read('all') ?? '');
+    return stream.close() == 0 ? { ok: true, text } : error(text || '命令执行失败');
+}
+
+function instance() {
+    const connection = connect();
+    if (!connection)
+        return null;
+    const data = connection.call('service', 'list', { name: service });
+    connection.disconnect();
+    return data?.[service]?.instances?.main;
+}
+
+function words(text) {
+    return type(text) == 'string' && trim(text) ? split(trim(text), /[ ,\t\r\n]+/) : [];
+}
+
+function read_direct_clients() {
+    const uci = cursor();
+    const current = uci.get_all(service, 'main') ?? {};
+    return { ok: true, addresses: [
+        ...words(current.bypass_ipv4),
+        ...words(current.bypass_ipv6)
+    ] };
+}
+
+function write_direct_clients(values) {
+    if (type(values) != 'array' || length(values) > 128)
+        return error('请输入有效的客户端 IP，最多 128 条');
+    const uci = cursor();
+    const ipv4 = [];
+    const ipv6 = [];
+    for (let value in uniq(values)) {
+        if (type(value) != 'string')
+            return error('请输入有效的客户端 IP');
+        if (match(value, /^[0-9]{1,3}(\.[0-9]{1,3}){3}(\/[0-9]{1,2})?$/))
+            push(ipv4, value);
+        else if (index(value, ':') >= 0 && match(value, /^[0-9a-fA-F:.]+(\/[0-9]{1,3})?$/))
+            push(ipv6, value);
+        else
+            return error('请输入有效的客户端 IP');
+    }
+    const options = { bypass_ipv4: join(' ', ipv4), bypass_ipv6: join(' ', ipv6) };
+
+    const settings = '/etc/config/' + service;
+    if (!lstat(settings) && writefile(settings, '') !== 0)
+        return error('无法创建局域网代理配置');
+    if (uci.changes(service)?.[service])
+        return error('局域网代理已有未提交的修改');
+
+    const previous = uci.get_all(service, 'main');
+    uci.set(service, 'main', 'proxy');
+    for (let key in keys(options))
+        uci.set(service, 'main', key, options[key]);
+    if (!uci.save(service)) {
+        uci.revert(service);
+        return error('无法保存访问控制');
+    }
+
+    let result = run(init + ' check_lan');
+    if (!result.ok || !uci.commit(service)) {
+        uci.revert(service);
+        return result.ok ? error('无法提交访问控制') : result;
+    }
+    result = run(init + ' refresh');
+    if (!result.ok) {
+        for (let key in keys(options)) {
+            if (previous?.[key] == null)
+                uci.delete(service, 'main', key);
+            else
+                uci.set(service, 'main', key, previous[key]);
+        }
+        uci.commit(service);
+        return result;
+    }
+    return { ok: true };
+}
+
+function editable(file) {
+    return file == 'config.json' ||
+        (type(file) == 'string' && match(file, /^(providers|rule-sets)\/[A-Za-z0-9_-]+\.json$/));
+}
+
+function list_files() {
+    const files = [ { file: 'config.json', title: 'sing-box 主配置', writable: true } ];
+    for (let folder in [ 'providers', 'rule-sets' ]) {
+        if (lstat(directory + '/' + folder)?.type != 'directory')
+            continue;
+        for (let name in sort(lsdir(directory + '/' + folder) ?? [])) {
+            const file = folder + '/' + name;
+            const info = lstat(directory + '/' + file);
+            if (editable(file) && info?.type == 'file')
+                push(files, { file, title: file, writable: true });
+        }
+    }
+    if (lstat(directory + '/momo-legacy.uci')?.type == 'file')
+        push(files, { file: 'momo-legacy.uci', title: '旧 Momo 配置（存档）', writable: false });
+    return { files };
+}
+
+function read_config(file) {
+    if (!editable(file) && file != 'momo-legacy.uci')
+        return error('未知的配置文件');
+    const path = directory + '/' + file;
+    const info = lstat(path);
+    if (!info && file == 'config.json')
+        return { ok: true, text: '' };
+    if (info?.type != 'file' || info.size > max_size ||
+        (index(file, '/') >= 0 && lstat(directory + '/' + split(file, '/')[0])?.type != 'directory'))
+        return error('配置文件不可用或超过 256 KiB');
+    const text = readfile(path, max_size + 1);
+    if (type(text) != 'string' || length(text) > max_size)
+        return error('无法读取配置');
+    return { ok: true, text };
+}
+
+function write_config(file, text) {
+    if (!editable(file) || type(text) != 'string' || length(text) > max_size)
+        return error('文件不可编辑或配置超过 256 KiB');
+    const current = read_config(file);
+    if (!current.ok)
+        return current;
+    if (file != 'config.json') {
+        try {
+            const parsed = json(text);
+            if (type(parsed) != 'object')
+                return error('文件必须是 JSON 对象');
+            if (index(file, 'providers/') == 0 &&
+                !(length(parsed.outbounds ?? []) || length(parsed.endpoints ?? [])))
+                return error('节点文件至少要有一个出站或端点');
+        } catch (e) {
+            return error('文件必须是有效的 JSON');
+        }
+    }
+
+    if (!lstat(directory))
+        mkdir(directory, 0700);
+    if (lstat(directory)?.type != 'directory')
+        return error('代理配置目录不可用');
+
+    const temporary = mkdtemp(directory + '/.luci.XXXXXX');
+    if (!temporary)
+        return error('无法创建临时配置');
+    const stage = temporary + '/config.json';
+    const result = writefile(stage, text) == length(text)
+        ? run('/usr/libexec/paopaodns-proxy-apply ' + stage + ' ' + file)
+        : error('无法写入临时配置');
+    unlink(stage);
+    rmdir(temporary);
+    return result;
+}
+
+function read_logs(kind) {
+    let predicate;
+    if (kind == 'proxy-service')
+        predicate = 'paopaodns-proxy:';
+    else if (kind == 'proxy-core') {
+        const core = instance();
+        if (!core?.running || type(core.pid) != 'int' || core.pid <= 0)
+            return { ok: true, text: '', total: 0 };
+        predicate = sprintf('sing-box\\[%d\\]:', core.pid);
+    } else {
+        return error('未知的代理日志类型');
+    }
+    const result = run("set -o pipefail; /sbin/logread -e '" + predicate + "' | /usr/bin/tail -n 500");
+    if (result.ok)
+        result.total = result.text ? length(split(result.text, '\n')) : 0;
+    return result;
+}
+
+return {
+    'luci.paopaodns.proxy': {
+        status: { call: () => ({ running: instance()?.running == true }) },
+        readDirectClients: { call: read_direct_clients },
+        writeDirectClients: {
+            args: { addresses: [] },
+            call: request => write_direct_clients(request.args.addresses)
+        },
+        coreAction: {
+            args: { action: '' },
+            call: function(request) {
+                const action = request.args.action;
+                if (action != 'start' && action != 'stop')
+                    return error('未知的核心操作');
+                return run(init + ' control_core ' + action);
+            }
+        },
+        listFiles: { call: list_files },
+        readConfig: {
+            args: { file: '' },
+            call: request => read_config(request.args.file || 'config.json')
+        },
+        writeConfig: {
+            args: { file: '', text: '' },
+            call: request => write_config(request.args.file || 'config.json', request.args.text)
+        },
+        readLogs: {
+            args: { kind: '' },
+            call: request => read_logs(request.args.kind)
+        }
+    }
+};

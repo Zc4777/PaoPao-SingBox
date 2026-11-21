@@ -1,0 +1,18 @@
+{
+  "luci-app-paopaodns-rs": {
+    "description": "Manage the PaoPaoDNS-RS service and its rule files",
+    "read": {
+      "uci": [ "paopaodns-rs" ],
+      "ubus": { "luci.paopaodns": [ "status", "readRule", "readLogs" ], "luci.paopaodns.proxy": [ "readLogs", "status" ] }
+    },
+    "write": {
+      "uci": [ "paopaodns-rs" ],
+      "ubus": { "luci.paopaodns": [ "serviceAction", "writeRule", "updateAddressDb" ], "luci.paopaodns.proxy": [ "coreAction" ] }
+    }
+  },
+  "luci-app-paopaodns-rs-proxy": {
+    "description": "Edit local sing-box configuration, including credentials",
+    "read": { "ubus": { "luci.paopaodns.proxy": [ "status", "readDirectClients" ] } },
+    "write": { "ubus": { "luci.paopaodns.proxy": [ "listFiles", "readConfig", "writeConfig", "writeDirectClients" ] } }
+  }
+}

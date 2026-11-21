@@ -1,0 +1,1 @@
+# 强制使用 recursive 上游。示例 full:www.example.org

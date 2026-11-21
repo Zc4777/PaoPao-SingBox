@@ -1,0 +1,38 @@
+{
+  "admin/services/paopaodns-rs": {
+    "title": "PaoPaoDNS-RS",
+    "order": 65,
+    "action": { "type": "firstchild" },
+    "depends": {
+      "acl": [ "luci-app-paopaodns-rs" ],
+      "uci": { "paopaodns-rs": true }
+    }
+  },
+  "admin/services/paopaodns-rs/settings": {
+    "title": "服务设置",
+    "order": 10,
+    "action": { "type": "view", "path": "paopaodns-rs/overview" }
+  },
+  "admin/services/paopaodns-rs/editor": {
+    "title": "规则编辑器",
+    "order": 20,
+    "action": { "type": "view", "path": "paopaodns-rs/editor" }
+  },
+  "admin/services/paopaodns-rs/lan": {
+    "title": "局域网代理",
+    "order": 23,
+    "action": { "type": "view", "path": "paopaodns-rs/lan" },
+    "depends": { "acl": [ "luci-app-paopaodns-rs-proxy" ] }
+  },
+  "admin/services/paopaodns-rs/proxy": {
+    "title": "代理编辑器",
+    "order": 25,
+    "action": { "type": "view", "path": "paopaodns-rs/proxy" },
+    "depends": { "acl": [ "luci-app-paopaodns-rs-proxy" ] }
+  },
+  "admin/services/paopaodns-rs/logs": {
+    "title": "日志",
+    "order": 30,
+    "action": { "type": "view", "path": "paopaodns-rs/logs" }
+  }
+}

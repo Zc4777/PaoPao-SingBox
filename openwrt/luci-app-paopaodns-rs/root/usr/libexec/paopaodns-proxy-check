@@ -1,0 +1,51 @@
+#!/usr/bin/ucode -S
+// SPDX-License-Identifier: GPL-3.0-only
+
+import { lstat, readfile } from 'fs';
+
+const directory = '/etc/paopaodns-rs/proxy';
+const path = ARGV[0];
+const max_size = 256 * 1024;
+
+function fail(message) {
+    print(message, '\n');
+    exit(1);
+}
+
+if (!path || lstat(path)?.type != 'file')
+    fail('请先保存代理配置');
+
+const content = readfile(path, max_size + 1);
+if (!content || length(content) > max_size)
+    fail('代理配置大小必须在 256 KiB 以内');
+
+let profile;
+try {
+    profile = json(content);
+} catch (e) {
+    fail('代理配置必须是有效的 JSON');
+}
+if (type(profile) != 'object' || type(profile.inbounds) != 'array')
+    fail('请配置 DNS 和透明代理入站');
+
+const dns = filter(profile.inbounds, inbound =>
+    inbound?.type == 'direct' && inbound.listen_port == 1020 &&
+    index([ '127.0.0.1', '0.0.0.0', '::' ], inbound.listen) >= 0);
+if (!length(dns))
+    fail('请配置可从 IPv4 本机访问的 DNS 入站，端口为 1020');
+
+const tproxy = filter(profile.inbounds, inbound =>
+    inbound?.type == 'tproxy' && inbound.listen == '::' && inbound.listen_port == 1060);
+if (!length(tproxy))
+    fail('请配置监听 [::]:1060 的透明代理入站');
+
+const servers = profile.dns?.servers;
+const fakeip = type(servers) == 'array' && filter(servers, server =>
+    server?.type == 'fakeip' && server.inet4_range == '7.0.0.0/8' && server.inet6_range == 'fc00::/18');
+if (!fakeip || !length(fakeip))
+    fail('Fake-IP 地址池须与转发规则一致，使用 7.0.0.0/8 和 fc00::/18');
+
+if (system('test -x /usr/bin/sing-box') != 0)
+    fail('请先安装 sing-box 核心');
+if (system([ '/usr/bin/sing-box', '-D', directory, '-c', path, 'check' ]) != 0)
+    fail('sing-box 拒绝了这份配置');

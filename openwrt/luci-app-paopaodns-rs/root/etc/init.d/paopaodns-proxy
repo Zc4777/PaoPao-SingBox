@@ -1,0 +1,235 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-3.0-only
+
+USE_PROCD=1
+START=74
+STOP=20
+
+CONFIG_DIR=/etc/paopaodns-rs/proxy
+CORE=/usr/bin/sing-box
+TABLE=1051
+MARK=0x200/0x200
+EXTRA_COMMANDS="refresh check_lan wait_core control_core"
+
+remove_routes() {
+    nft delete table inet paopaodns_proxy 2>/dev/null || :
+    for family in -4 -6; do
+        ip "$family" rule del pref "$TABLE" fwmark "$MARK" lookup "$TABLE" 2>/dev/null || :
+        ip "$family" route del local default dev lo table "$TABLE" 2>/dev/null || :
+    done
+}
+
+write_direct_set() {
+    local name="$1" type="$2" option="$3" value values="" separator=""
+    for value in $(uci -q get "paopaodns-proxy.main.$option"); do
+        case "$value" in *[!0-9a-fA-F:./]*) return 1;; esac
+        values="$values$separator$value"
+        separator=", "
+    done
+    printf '    set %s {\n        type %s; flags interval; auto-merge;\n' "$name" "$type"
+    [ -z "$values" ] || printf '        elements = { %s };\n' "$values"
+    printf '    }\n'
+}
+
+write_rules() {
+    local networks net device devices="" enabled ipv4 ipv6
+    networks="$(uci -q get paopaodns-proxy.main.lan_networks || echo lan)"
+    enabled="$(uci -q get paopaodns-proxy.main.lan_enabled)"
+    ipv4="$(uci -q get paopaodns-proxy.main.lan_ipv4)"
+    ipv6="$(uci -q get paopaodns-proxy.main.lan_ipv6)"
+    for net in $networks; do
+        case "$net" in *[!a-zA-Z0-9_.-]*) return 1;; esac
+        device="$(ubus call "network.interface.$net" status 2>/dev/null | jsonfilter -e '@.l3_device')"
+        case "$device" in
+            *[!a-zA-Z0-9_.:-]*) return 1;;
+            '') continue;;
+        esac
+        devices="$devices $device"
+    done
+
+    cat <<'EOF'
+add table inet paopaodns_proxy
+delete table inet paopaodns_proxy
+table inet paopaodns_proxy {
+EOF
+    write_direct_set direct_v4 ipv4_addr bypass_ipv4 || return 1
+    write_direct_set direct_v6 ipv6_addr bypass_ipv6 || return 1
+    cat <<'EOF'
+    chain divert {
+        type filter hook prerouting priority mangle + 5; policy accept;
+EOF
+    for device in $devices; do
+        printf '        iifname "%s" jump fake_ip\n' "$device"
+    done
+    cat <<'EOF'
+    }
+    chain fake_ip {
+        ct direction reply return
+        fib daddr type local return
+        ip saddr @direct_v4 return
+        ip6 saddr @direct_v6 return
+EOF
+    if [ "$enabled" != 0 ] && [ "$ipv4" != 0 ]; then
+        echo '        ip daddr 7.0.0.0/8 meta l4proto { tcp, udp } tproxy ip to :1060 meta mark set meta mark | 0x200 counter accept'
+    fi
+    if [ "$enabled" != 0 ] && [ "$ipv6" != 0 ]; then
+        echo '        ip6 daddr fc00::/18 meta l4proto { tcp, udp } tproxy ip6 to :1060 meta mark set meta mark | 0x200 counter accept'
+    fi
+    cat <<'EOF'
+        ip daddr 7.0.0.0/8 counter drop
+        ip6 daddr fc00::/18 counter drop
+    }
+    chain direct_dns {
+        type nat hook prerouting priority dstnat - 2; policy accept;
+EOF
+    for device in $devices; do
+        printf '        iifname "%s" meta l4proto { tcp, udp } th dport 53 jump keep_dns\n' "$device"
+    done
+    # A destination NAT binding to the same address keeps the client's
+    # original resolver and prevents the later PaoPaoDNS redirect.
+    cat <<'EOF'
+    }
+    chain keep_dns {
+        ip saddr @direct_v4 counter dnat ip to ip daddr
+        ip6 saddr @direct_v6 counter dnat ip6 to ip6 daddr
+    }
+    chain protect_inbound {
+        type filter hook input priority filter - 5; policy accept;
+        meta mark & 0x200 == 0 meta l4proto { tcp, udp } th dport 1060 drop
+        iifname "lo" return
+EOF
+    for device in $devices; do
+        printf '        iifname "%s" return\n' "$device"
+    done
+    local port ports="" separator=""
+    for port in $(jsonfilter -i "$CONFIG_DIR/config.json" \
+        -e '@.inbounds[*].listen_port' -e '@.services[*].listen_port' 2>/dev/null | sort -nu); do
+        case "$port" in *[!0-9]*) return 1;; esac
+        ports="$ports$separator$port"
+        separator=", "
+    done
+    if [ -n "$ports" ]; then
+        printf '        meta l4proto { tcp, udp } th dport { %s } drop\n' "$ports"
+    fi
+    printf '    }\n}\n'
+}
+
+apply_rules() (
+    umask 077
+    local rules
+    rules="$(mktemp /tmp/paopaodns-proxy-nft.XXXXXX)" || exit 1
+    trap 'rm -f "$rules"' EXIT
+    write_rules > "$rules" && nft "$@" -f "$rules"
+)
+
+check_lan() {
+    apply_rules -c
+}
+
+setup_routes() {
+    local family
+    for family in -4 -6; do
+        ip "$family" route replace local default dev lo table "$TABLE" || return 1
+        ip "$family" rule show pref "$TABLE" | grep -Fq "fwmark $MARK lookup $TABLE" ||
+            ip "$family" rule add pref "$TABLE" fwmark "$MARK" lookup "$TABLE" || return 1
+    done
+    apply_rules
+}
+
+core_pid() {
+    ubus call service list '{"name":"paopaodns-proxy"}' |
+        jsonfilter -q -e '@["paopaodns-proxy"].instances.main.pid'
+}
+
+wait_core() {
+    local pid
+    for attempt in 1 2 3 4 5 6 7 8; do
+        pid="$(core_pid)"
+        if [ -n "$pid" ] && netstat -lnptu 2>/dev/null | awk -v owner="$pid/sing-box" '
+            $NF == owner && ($1 == "tcp" || $1 == "udp") {
+                sub(/^.*:/, "", $4)
+                if ($4 == 1020 || $4 == 1060) seen[$1, $4] = 1
+            }
+            END { exit !(seen["tcp",1020] && seen["udp",1020] && seen["tcp",1060] && seen["udp",1060]) }
+        '; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+control_core() (
+    local action="$1" pid
+    case "$action" in start|stop) ;; *) exit 1;; esac
+    if [ ! -d "$CONFIG_DIR" ]; then
+        [ "$action" = stop ] && exit 0
+        echo '请先在代理编辑器保存配置'
+        exit 1
+    fi
+
+    exec 9>"$CONFIG_DIR/.config.lock"
+    flock -n 9 || { echo '已有代理操作正在执行'; exit 1; }
+    if [ "$action" = start ]; then
+        if ! running; then
+            [ "$(uci -q get paopaodns-proxy.main.enabled)" = 1 ] ||
+                { echo '请先在代理编辑器保存配置'; exit 1; }
+            start
+        fi
+        if wait_core; then
+            exit 0
+        fi
+        stop >/dev/null 2>&1
+        echo 'sing-box 启动失败，请查看核心日志'
+        exit 1
+    fi
+
+    pid="$(core_pid)"
+    if [ -z "$pid" ]; then
+        remove_routes
+        exit 0
+    fi
+    stop || exit 1
+    for attempt in 1 2 3 4 5 6 7 8; do
+        kill -0 "$pid" 2>/dev/null || exit 0
+        sleep 1
+    done
+    echo 'sing-box 尚未停止，请刷新状态'
+    exit 1
+)
+
+start_service() {
+    [ "$(uci -q get paopaodns-proxy.main.enabled)" = 1 ] || return 0
+    /usr/libexec/paopaodns-proxy-check "$CONFIG_DIR/config.json" || return 1
+    setup_routes || { remove_routes; return 1; }
+
+    procd_open_instance main
+    procd_set_param command "$CORE" -D "$CONFIG_DIR" -c "$CONFIG_DIR/config.json" run --disable-color
+    procd_set_param file "$CONFIG_DIR/config.json"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn 3600 5 5
+    procd_set_param limits nofile="65536 65536"
+    procd_close_instance
+    logger -t paopaodns-proxy '已提交 sing-box 启动请求并加载 Fake-IP 规则'
+}
+
+stop_service() {
+    remove_routes
+    logger -t paopaodns-proxy '已撤下 Fake-IP 转发规则'
+}
+
+reload_service() {
+    stop
+    start
+}
+
+refresh() {
+    running || return 0
+    setup_routes || return 1
+    logger -t paopaodns-proxy '已更新局域网 Fake-IP 规则'
+}
+
+service_triggers() {
+    procd_add_raw_trigger 'interface.*' 1000 /etc/init.d/paopaodns-proxy refresh
+}

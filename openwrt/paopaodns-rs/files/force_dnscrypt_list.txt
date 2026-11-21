@@ -1,0 +1,1 @@
+# 强制使用 encrypted 上游。示例 domain:example.net

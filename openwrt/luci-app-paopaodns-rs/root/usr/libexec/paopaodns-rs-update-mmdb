@@ -1,0 +1,232 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+set -eu
+
+state=/var/run/paopaodns-rs-update
+case "${1:-start}" in
+	start)
+		exec 9>"$state.lock"
+		flock -n 9 || exit 0
+		printf 'running\n' > "$state.next"
+		mv -f "$state.next" "$state"
+		/bin/sh "$0" worker </dev/null >/dev/null 2>&1 &
+		exit 0
+		;;
+	worker)
+		status=done
+		/bin/sh "$0" update > "$state.output" 2>&1 || status=error
+		{
+			printf '%s\n' "$status"
+			tail -c 3000 "$state.output"
+		} > "$state.next"
+		mv -f "$state.next" "$state"
+		rm -f "$state.output"
+		exit 0
+		;;
+	update) ;;
+	*) exit 1 ;;
+esac
+
+set -o pipefail
+
+dir=/etc/paopaodns-rs
+init=/etc/init.d/paopaodns-rs
+section=paopaodns-rs.main
+db_name=Country-only-cn-private.mmdb
+db="$dir/$db_name"
+mark_name=global_mark.dat
+raw=https://raw.githubusercontent.com/kkkgo
+cdn=https://cdn.jsdelivr.net/gh/kkkgo
+work="$(mktemp -d "$dir/.data.XXXXXX")"
+
+fail() {
+	echo "$*" >&2
+	exit 1
+}
+
+remove_marks() {
+	rm -f "$1/global_mark.txt" "$1/cn_mark.txt"
+	rmdir "$1"
+}
+
+cleanup() {
+	if [ -d "$work/marks" ]; then remove_marks "$work/marks"; fi
+	rm -f "$work/archive" "$work/db" "$work/db.before" "$work/sum" "$work/download.error" "$work/sorted"
+	rmdir "$work"
+}
+trap cleanup EXIT
+
+get_option() {
+	uci -q get "$section.$1" || :
+}
+
+download() {
+	local repo="$1" file="$2" dest="$3" size="$4" remote family seconds=12
+	[ "$file" != "$mark_name" ] || seconds=75
+	for remote in "$raw/$repo/main" "$cdn/$repo@main"; do
+		for family in -6 -4; do
+			if curl "$family" -fLsS --proto '=https' --proto-redir '=https' \
+				--connect-timeout 3 --max-time "$seconds" --max-filesize "$size" \
+				"$remote/$file" -o "$dest" 2>"$work/download.error"; then
+				rm -f "$work/download.error"
+				return 0
+			fi
+		done
+	done
+	cat "$work/download.error" >&2
+	rm -f "$work/download.error"
+	return 1
+}
+
+checksum() {
+	download "$1" "$2.sha256sum" "$work/sum" 2048 || return 1
+	local hash
+	hash="$(awk 'NR == 1 { print tolower($1); exit }' "$work/sum")"
+	printf '%s\n' "$hash" | grep -Ex '[0-9a-f]{64}'
+}
+
+verify() {
+	printf '%s  %s\n' "$1" "$2" | sha256sum -c -s -
+}
+
+configured_db="$(get_option mmdb)"
+old_global="$(get_option global_mark)"
+old_cn="$(get_option cn_mark)"
+old_marks="${old_global%/*}"
+new_marks=
+db_changed=0
+
+if [ -z "$configured_db" ] || [ "$configured_db" = "$db" ]; then
+	expected="$(checksum Country-only-cn-private.mmdb "$db_name")" || fail '无法获取有效的 CN 地址库校验值'
+	if [ -f "$db" ] && verify "$expected" "$db"; then
+		db_result='CN 地址库已是最新版本'
+	else
+		download Country-only-cn-private.mmdb "$db_name" "$work/db" 4194304 || fail 'CN 地址库下载失败'
+		verify "$expected" "$work/db" || fail 'CN 地址库 SHA-256 校验失败'
+		chmod 0644 "$work/db"
+		db_result='CN 地址库已更新'
+		db_changed=1
+	fi
+else
+	db_result='保留当前自定义 CN 地址库'
+fi
+
+if { [ -z "$old_global" ] && [ -z "$old_cn" ]; } ||
+	{ [ "$old_global" = "$old_marks/global_mark.txt" ] &&
+	  [ "$old_cn" = "$old_marks/cn_mark.txt" ] &&
+	  [ "${old_marks%/*}" = "$dir" ] &&
+	  printf '%s\n' "${old_marks##*/}" | grep -Eq '^marks-([0-9a-f]{7}|[0-9a-f]{64})$'; }; then
+	expected="$(checksum PaoPao-Pref "$mark_name")" || fail '无法获取有效的域名标记校验值'
+	candidate="$dir/marks-$expected"
+	if [ "$old_marks" = "$candidate" ] && [ -s "$old_global" ] && [ -s "$old_cn" ]; then
+		mark_result='域名标记已是最新版本'
+	else
+		download PaoPao-Pref "$mark_name" "$work/archive" 16777216 || fail '域名标记下载失败'
+		verify "$expected" "$work/archive" || fail '域名标记 SHA-256 校验失败'
+		size="$(wc -c < "$work/archive")"
+		[ "$size" -gt 1024 ] || fail '域名标记归档格式无效'
+		mkdir "$work/marks"
+		# PaoPao-Pref appends a 1024-byte checksum trailer after the XZ stream.
+		if ! (
+			ulimit -f 65536
+			head -c "$((size - 1024))" "$work/archive" |
+				xz --decompress --stdout --memlimit-decompress=128MiB |
+				awk -v known="$work/marks/global_mark.txt" -v cn="$work/marks/cn_mark.txt" '
+					function rule(value, file) {
+						if (value !~ /^domain:[-.A-Za-z0-9_]+$/) return
+						sub(/^domain:\.+/, "domain:", value)
+						print value > file
+					}
+					{ sub(/\r$/, ""); sub(/^\xef\xbb\xbf/, "") }
+					/^domain:/  { rule($0, known); next }
+					/^##@@/     { rule(substr($0, 5), cn); next }
+					/^#@/       { rule(substr($0, 3), cn) }
+				'
+		); then
+			fail '域名标记解压或转换失败'
+		fi
+		[ -s "$work/marks/global_mark.txt" ] && [ -s "$work/marks/cn_mark.txt" ] ||
+			fail '域名标记归档缺少全球或 CN 数据'
+		for list in global_mark.txt cn_mark.txt; do
+			LC_ALL=C sort -u "$work/marks/$list" > "$work/sorted"
+			mv "$work/sorted" "$work/marks/$list"
+		done
+		known_count="$(wc -l < "$work/marks/global_mark.txt" | awk '{print $1}')"
+		cn_count="$(wc -l < "$work/marks/cn_mark.txt" | awk '{print $1}')"
+		mark_result="域名标记已更新（全球 $known_count 条，CN $cn_count 条）"
+		new_marks="$candidate"
+	fi
+else
+	mark_result='保留当前自定义域名标记'
+fi
+
+if [ "$db_changed" -eq 0 ] && [ -z "$new_marks" ]; then
+	printf '%s\n%s\n' "$db_result" "$mark_result"
+	exit 0
+fi
+
+set -- /usr/sbin/paopaodns-rs --check
+[ "$db_changed" -eq 0 ] || set -- "$@" --mmdb "$work/db"
+[ -z "$new_marks" ] || set -- "$@" --global-mark "$work/marks/global_mark.txt" --cn-mark "$work/marks/cn_mark.txt"
+"$@" >/dev/null || fail '新分流数据未通过配置校验'
+
+[ -z "$(uci changes paopaodns-rs)" ] &&
+	[ "$configured_db" = "$(get_option mmdb)" ] &&
+	[ "$old_global" = "$(get_option global_mark)" ] &&
+	[ "$old_cn" = "$(get_option cn_mark)" ] ||
+	fail '分流配置在更新期间已更改，请重新更新'
+
+db_published=0
+marks_published=0
+marks_configured=0
+
+publish() {
+	if [ "$db_changed" -eq 1 ]; then
+		if [ -f "$db" ]; then cp -p "$db" "$work/db.before" || return 1; fi
+		mv -f "$work/db" "$db" || return 1
+		db_published=1
+	fi
+	if [ -n "$new_marks" ]; then
+		if [ -e "$new_marks" ]; then
+			cmp -s "$new_marks/global_mark.txt" "$work/marks/global_mark.txt" &&
+				cmp -s "$new_marks/cn_mark.txt" "$work/marks/cn_mark.txt" || return 1
+		else
+			chmod 0755 "$work/marks" && mv "$work/marks" "$new_marks" || return 1
+			marks_published=1
+		fi
+		marks_configured=1
+		uci set "$section.global_mark=$new_marks/global_mark.txt" &&
+			uci set "$section.cn_mark=$new_marks/cn_mark.txt" &&
+			uci commit paopaodns-rs || return 1
+	fi
+	"$init" check_config >/dev/null && "$init" reload >/dev/null
+}
+
+restore_option() {
+	if [ -n "$2" ]; then
+		uci set "$section.$1=$2"
+	else
+		uci -q delete "$section.$1" || :
+	fi
+}
+
+if ! publish; then
+	if [ "$marks_configured" -eq 1 ]; then
+		restore_option global_mark "$old_global"
+		restore_option cn_mark "$old_cn"
+		uci commit paopaodns-rs
+	fi
+	if [ "$db_published" -eq 1 ]; then
+		if [ -f "$work/db.before" ]; then mv -f "$work/db.before" "$db"; else rm -f "$db"; fi
+	fi
+	if [ "$marks_published" -eq 1 ]; then remove_marks "$new_marks"; fi
+	"$init" reload >/dev/null || :
+	fail '新分流数据应用失败，已恢复原有数据'
+fi
+
+# Clean up previous versions created by the updater after the new pair is active.
+if [ -n "$new_marks" ] && [ "$old_marks" != "$new_marks" ] && [ -d "$old_marks" ] &&
+	printf '%s\n' "${old_marks##*/}" | grep -Eq '^marks-[0-9a-f]{64}$'; then
+	remove_marks "$old_marks" || :
+fi
+printf '%s\n%s\n' "$db_result" "$mark_result"
