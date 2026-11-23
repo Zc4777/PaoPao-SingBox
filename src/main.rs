@@ -24,7 +24,7 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::Semaphore,
-    task::LocalSet,
+    task::{JoinHandle, LocalSet},
     time::timeout,
 };
 
@@ -380,6 +380,13 @@ async fn shutdown() -> io::Result<()> {
     tokio::signal::ctrl_c().await
 }
 
+async fn finish_cache_save(task: JoinHandle<io::Result<()>>, cache: &RefCell<Cache>) {
+    if let Err(err) = task.await.map_err(io::Error::other).and_then(|result| result) {
+        eprintln!("could not save DNS cache: {err}");
+        cache.borrow_mut().retry_save();
+    }
+}
+
 async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     config.validate()?;
     let rules = Rules::load(&config)?;
@@ -398,6 +405,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .filter(|_| config.cache_entries > 0);
     let cache_file_limit = config.cache_file_mib as usize * 1024 * 1024;
+    if cache_file.is_some() {
+        cache = cache.with_disk(cache_file_limit, config.recursive);
+    }
     let stats_file = config.stats_file.clone();
     let restored = match cache_file.as_ref().map(|path| {
         cache.restore(path, &config, cache_file_limit, |request, answer| {
@@ -422,6 +432,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_save = Instant::now();
+    let mut cache_save: Option<JoinHandle<io::Result<()>>> = None;
     let mut buffer = [0u8; MAX_QUERY_SIZE + 1];
     println!("paopaodns-rs listening on {listen} (UDP/TCP)");
     let stop = shutdown();
@@ -429,8 +440,11 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             signal = &mut stop => {
+                if let Some(task) = cache_save.take() {
+                    finish_cache_save(task, &server.cache).await;
+                }
                 if let Some(path) = &cache_file
-                    && let Err(err) = server.cache.borrow_mut().save(path, server.config.recursive, cache_file_limit)
+                    && let Err(err) = server.cache.borrow_mut().save(path, server.config.recursive)
                 {
                     eprintln!("could not save DNS cache: {err}");
                 }
@@ -438,11 +452,21 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = maintenance.tick() => {
                 dns::prune_idle_tls();
-                if last_save.elapsed() >= Duration::from_secs(60) {
-                    if let Some(path) = &cache_file
-                        && let Err(err) = server.cache.borrow_mut().save(path, server.config.recursive, cache_file_limit)
-                    {
-                        eprintln!("could not save DNS cache: {err}");
+                if cache_save.as_ref().is_some_and(JoinHandle::is_finished)
+                    && let Some(task) = cache_save.take()
+                {
+                    finish_cache_save(task, &server.cache).await;
+                }
+                if last_save.elapsed() >= Duration::from_secs(60) && cache_save.is_none() {
+                    if let Some(path) = &cache_file {
+                        match server.cache.borrow_mut().snapshot(server.config.recursive) {
+                            Ok(Some(data)) => {
+                                let path = path.clone();
+                                cache_save = Some(tokio::task::spawn_blocking(move || cache::atomic_write(&path, &data, true)));
+                            }
+                            Err(err) => eprintln!("could not prepare DNS cache snapshot: {err}"),
+                            Ok(None) => {}
+                        }
                     }
                     last_save = Instant::now();
                 }

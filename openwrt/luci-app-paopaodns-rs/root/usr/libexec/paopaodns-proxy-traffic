@@ -1,0 +1,128 @@
+#!/usr/bin/ucode -S
+// SPDX-License-Identifier: GPL-3.0-only
+
+'use strict';
+
+import { mkdtemp, popen, readfile, rename, rmdir, unlink, writefile } from 'fs';
+import { connect } from 'ubus';
+
+const directory = '/etc/paopaodns-rs/proxy';
+const history_file = directory + '/traffic-history.json';
+
+function read_json(path, limit) {
+    try {
+        return json(readfile(path, limit) ?? '');
+    } catch (e) {
+        return null;
+    }
+}
+
+function process_id(bus) {
+    const service = bus.call('service', 'list', { name: 'paopaodns-proxy' });
+    const main = service?.['paopaodns-proxy']?.instances?.main;
+    if (main?.running != true || type(main.pid) != 'int')
+        return null;
+    const boot = trim(readfile('/proc/sys/kernel/random/boot_id') ?? '');
+    const stat = match(trim(readfile('/proc/' + main.pid + '/stat') ?? ''), /^[0-9]+ \(.*\) (.+)$/);
+    const started = stat ? split(stat[1], ' ')[19] : null;
+    return boot && started ? boot + ':' + main.pid + ':' + started : null;
+}
+
+function decode_status(data) {
+    // Read one uncompressed gRPC-Web Status message. Fields 5, 8 and 9
+    // hold trafficAvailable, uplinkTotal and downlinkTotal respectively.
+    if (!data || length(data) < 5 || ord(substr(data, 0, 1)) != 0)
+        return null;
+    let end = 0;
+    for (let i = 1; i < 5; i++)
+        end = end * 256 + ord(substr(data, i, 1));
+    end += 5;
+    if (end > length(data))
+        return null;
+
+    let offset = 5;
+    let fields = {};
+    while (offset < end) {
+        const key = ord(substr(data, offset++, 1));
+        if (!key || key >= 128 || (key & 7) != 0)
+            return null;
+        let value = 0;
+        let shift = 0;
+        let byte = 128;
+        while (byte & 128) {
+            if (offset >= end || shift > 56)
+                return null;
+            byte = ord(substr(data, offset++, 1));
+            value |= (byte & 127) << shift;
+            shift += 7;
+        }
+        fields[key >> 3] = value;
+    }
+    return fields[5] == 1 ? [ fields[8] ?? 0, fields[9] ?? 0 ] : null;
+}
+
+function query_status(api, request, headers) {
+    if (writefile(request, '\x00\x00\x00\x00\x00') != 5)
+        return null;
+    let header = 'content-type: application/grpc-web+proto\n';
+    if (type(api.secret) == 'string' && length(api.secret)) {
+        if (match(api.secret, /[[:cntrl:]]/))
+            return null;
+        header += 'authorization: Bearer ' + api.secret + '\n';
+    }
+    if (writefile(headers, header) != length(header))
+        return null;
+    const host = api.listen == '::1' ? '[::1]' : '127.0.0.1';
+    const scheme = api.tls?.enabled == true ? 'https' : 'http';
+    const stream = popen('curl -q --silent --fail --noproxy "*" --max-time 2' +
+        ' --header @' + headers + ' --data-binary @' + request +
+        ' ' + scheme + '://' + host + ':' + api.listen_port + '/daemon.StartedService/SubscribeStatus');
+    if (!stream)
+        return null;
+    const frame = stream.read(256);
+    stream.close();
+    return decode_status(frame);
+}
+
+function totals(api) {
+    const scratch = mkdtemp('/tmp/paopaodns-traffic.XXXXXX');
+    if (!scratch)
+        return null;
+    const request = scratch + '/request';
+    const headers = scratch + '/headers';
+    let counters = null;
+    try {
+        counters = query_status(api, request, headers);
+    } catch (e) {
+        // A missing or incompatible API leaves a gap in the history.
+    }
+    unlink(headers);
+    unlink(request);
+    rmdir(scratch);
+    return counters;
+}
+
+const bus = connect();
+const id = bus ? process_id(bus) : null;
+if (!id)
+    exit(0);
+const profile = read_json(directory + '/config.json', 262144);
+const api = filter(profile?.services ?? [], entry => entry.type == 'api' &&
+    type(entry.listen_port) == 'int' && entry.listen_port > 0 && entry.listen_port <= 65535)[0];
+const counters = api ? totals(api) : null;
+if (!counters || process_id(bus) != id)
+    exit(0);
+bus.disconnect();
+
+const now = time();
+const history = read_json(history_file, 32768);
+const samples = filter(history?.samples ?? [], point => point[0] > now - 86400 && point[0] <= now);
+const last = history?.last;
+const span = last ? now - last.time : 0;
+if (last?.id == id && span > 0 && span <= 600 && counters[0] >= last.up && counters[1] >= last.down)
+    push(samples, [ now, span, counters[0] - last.up, counters[1] - last.down ]);
+
+const updated = sprintf('%J\n', { last: { id, time: now, up: counters[0], down: counters[1] }, samples });
+const temporary = history_file + '.tmp';
+if (writefile(temporary, updated) != length(updated) || !rename(temporary, history_file))
+    unlink(temporary);

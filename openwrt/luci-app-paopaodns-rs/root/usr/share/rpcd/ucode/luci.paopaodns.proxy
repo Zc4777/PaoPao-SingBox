@@ -183,14 +183,32 @@ function read_logs(kind) {
         return error('未知的代理日志类型');
     }
     const result = run("set -o pipefail; /sbin/logread -e '" + predicate + "' | /usr/bin/tail -n 500");
-    if (result.ok)
+    if (result.ok) {
+        if (kind == 'proxy-core')
+            result.text = replace(result.text,
+                /(sing-box\[[0-9]+\]: )([+-][0-9]{4} )?[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)? /g,
+                '$1');
         result.total = result.text ? length(split(result.text, '\n')) : 0;
+    }
     return result;
+}
+
+function traffic_history() {
+    const now = time();
+    let samples = [];
+    try {
+        const history = json(readfile(directory + '/traffic-history.json', 32768) ?? '');
+        samples = filter(history?.samples ?? [], point => point[0] > now - 86400 && point[0] <= now);
+    } catch (e) {
+        // The sampler may not have produced its first record yet.
+    }
+    return { now, samples };
 }
 
 return {
     'luci.paopaodns.proxy': {
         status: { call: core_status },
+        trafficHistory: { call: traffic_history },
         readDirectClients: { call: read_direct_clients },
         writeDirectClients: {
             args: { addresses: [] },

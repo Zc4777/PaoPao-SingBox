@@ -16,8 +16,8 @@ use std::{
 
 pub struct Cache {
     items: Option<LruCache<Vec<u8>, Entry>>,
+    disk: Option<DiskCache>,
     max_ttl: u32,
-    dirty: bool,
 }
 
 const MAX_STALE_AGE: Duration = Duration::from_secs(300);
@@ -42,9 +42,110 @@ struct Entry {
     retry_after: Option<Instant>,
 }
 
-impl Entry {
+struct DiskCache {
+    entries: LruCache<Vec<u8>, DiskEntry>,
+    bytes: usize,
+    limit: usize,
+    dirty: bool,
+}
+
+struct DiskEntry {
+    wire: Vec<u8>,
+    inserted: Instant,
+    age_at_insert: Duration,
+    max_age: Duration,
+}
+
+impl DiskEntry {
     fn age(&self) -> Duration {
         self.age_at_insert + self.inserted.elapsed()
+    }
+
+    fn size(&self, key: &[u8]) -> usize {
+        key.len() + self.wire.len() + 10
+    }
+}
+
+impl DiskCache {
+    fn remove(&mut self, key: &[u8]) {
+        if let Some(entry) = self.entries.pop(key) {
+            self.bytes -= entry.size(key);
+            self.dirty = true;
+        }
+    }
+
+    fn insert(&mut self, key: Vec<u8>, entry: DiskEntry, restoring: bool) -> bool {
+        let size = entry.size(&key);
+        if size > self.limit || entry.wire.len() > MAX_QUERY_SIZE {
+            return false;
+        }
+        // Snapshots are ordered newest first. Keep the newest entries if a
+        // legacy snapshot becomes larger during migration.
+        if restoring && (self.bytes + size > self.limit || self.entries.contains(&key)) {
+            return false;
+        }
+        self.remove(&key);
+        while self.bytes + size > self.limit {
+            let (old_key, old_entry) = self.entries.pop_lru().expect("disk cache has entries to evict");
+            self.bytes -= old_entry.size(&old_key);
+        }
+        if restoring {
+            self.entries.put(key.clone(), entry);
+            self.entries.demote(&key);
+        } else {
+            self.entries.put(key, entry);
+            self.dirty = true;
+        }
+        self.bytes += size;
+        true
+    }
+}
+
+impl Entry {
+    fn new(message: Message, max_ttl: u32, persistent: bool, age: Duration, restored: bool) -> Option<Self> {
+        if message.metadata.message_type != hickory_proto::op::MessageType::Response
+            || message.metadata.response_code != ResponseCode::NoError
+            || message.metadata.truncation
+            || message.answers.is_empty()
+            || message.edns.as_ref().is_some_and(|edns| !edns.options().options.is_empty())
+        {
+            return None;
+        }
+        let ttl = records(&message).map(|record| record.ttl).min()?.min(max_ttl);
+        let entry = Self {
+            inserted: Instant::now(),
+            age_at_insert: age,
+            ttl: Duration::from_secs(u64::from(ttl)),
+            refreshable: persistent && is_public_address_reply(&message),
+            message,
+            persistent,
+            restored,
+            refreshing: false,
+            retry_after: None,
+        };
+        (ttl > 0 && age < entry.max_age()).then_some(entry)
+    }
+
+    fn age(&self) -> Duration {
+        self.age_at_insert + self.inserted.elapsed()
+    }
+
+    fn max_age(&self) -> Duration {
+        if self.refreshable { self.ttl + MAX_STALE_AGE } else { self.ttl }
+    }
+
+    fn disk_entry(&self) -> Option<DiskEntry> {
+        let mut reply = self.message.clone();
+        let ttl = self.ttl.as_secs() as u32;
+        for record in reply.answers.iter_mut().chain(&mut reply.authorities).chain(&mut reply.additionals) {
+            record.ttl = record.ttl.min(ttl);
+        }
+        Some(DiskEntry {
+            wire: reply.to_vec().ok()?,
+            inserted: self.inserted,
+            age_at_insert: self.age_at_insert,
+            max_age: self.max_age(),
+        })
     }
 
     fn prefetch_due(&self, elapsed: Duration, now: Instant) -> bool {
@@ -89,9 +190,21 @@ impl Cache {
     pub fn new(entries: u32, max_ttl: u32) -> Self {
         Self {
             items: NonZeroUsize::new(entries as usize).map(LruCache::new),
+            disk: None,
             max_ttl,
-            dirty: false,
         }
+    }
+
+    pub fn with_disk(mut self, max_bytes: usize, upstream: SocketAddr) -> Self {
+        if self.items.is_some() {
+            self.disk = Some(DiskCache {
+                entries: LruCache::unbounded(),
+                bytes: 0,
+                limit: max_bytes.saturating_sub(18 + upstream.to_string().len()),
+                dirty: false,
+            });
+        }
+        self
     }
 
     pub fn key<'a>(&self, request: &Message, packet: &'a [u8]) -> Option<&'a [u8]> {
@@ -109,12 +222,27 @@ impl Cache {
 
     pub fn get(&mut self, key: &[u8], id: u16, allow_stale: bool) -> Option<CacheHit> {
         let items = self.items.as_mut()?;
+        if !items.contains(key) {
+            let disk = self.disk.as_mut()?;
+            let stored = disk.entries.get(key)?;
+            let age = stored.age();
+            if age >= stored.max_age {
+                disk.remove(key);
+                return None;
+            }
+            let message = Message::from_vec(&stored.wire).ok()?;
+            let entry = Entry::new(message, self.max_ttl, true, age, true)?;
+            items.put(key.to_vec(), entry);
+        }
         let entry = items.get(key)?;
+        if entry.persistent && let Some(disk) = &mut self.disk {
+            disk.entries.promote(key);
+        }
         let now = Instant::now();
         let elapsed = entry.age();
         if elapsed >= entry.ttl {
-            if !entry.refreshable || elapsed >= entry.ttl + MAX_STALE_AGE {
-                items.pop(key);
+            if elapsed >= entry.max_age() {
+                self.invalidate(key);
                 return None;
             }
             if !allow_stale {
@@ -165,66 +293,36 @@ impl Cache {
     }
 
     pub fn invalidate(&mut self, key: &[u8]) {
-        if let Some(entry) = self.items.as_mut().and_then(|items| items.pop(key)) {
-            self.dirty |= entry.persistent;
+        if let Some(items) = &mut self.items {
+            items.pop(key);
+        }
+        if let Some(disk) = &mut self.disk {
+            disk.remove(key);
         }
     }
 
     pub fn insert(&mut self, key: &[u8], answer: &Answer, persistent: bool) {
         self.invalidate(key);
-        if answer.bytes.len() <= MAX_QUERY_SIZE {
-            self.put(key.to_vec(), answer.message.clone(), persistent, Duration::ZERO, false);
+        let Some(items) = &mut self.items else { return };
+        if answer.bytes.len() > MAX_QUERY_SIZE {
+            return;
+        }
+        if let Some(entry) = Entry::new(answer.message.clone(), self.max_ttl, persistent, Duration::ZERO, false) {
+            if persistent
+                && let Some(disk) = &mut self.disk
+                && let Some(stored) = entry.disk_entry()
+            {
+                disk.insert(key.to_vec(), stored, false);
+            }
+            items.put(key.to_vec(), entry);
         }
     }
 
     #[cfg(test)]
     pub fn set_entry_age(&mut self, key: &[u8], age: Duration) {
         self.items.as_mut().unwrap().get_mut(key).unwrap().age_at_insert = age;
-    }
-
-    fn put(&mut self, key: Vec<u8>, message: Message, persistent: bool, age: Duration, restored: bool) {
-        let Some(items) = &mut self.items else { return };
-        if message.metadata.message_type != hickory_proto::op::MessageType::Response
-            || message.metadata.response_code != ResponseCode::NoError
-            || message.metadata.truncation
-            || message.answers.is_empty()
-            || message
-                .edns
-                .as_ref()
-                .is_some_and(|edns| !edns.options().options.is_empty())
-        {
-            return;
-        }
-        let ttl = message
-            .answers
-            .iter()
-            .chain(&message.authorities)
-            .chain(&message.additionals)
-            .map(|record| record.ttl)
-            .min()
-            .unwrap_or_default()
-            .min(self.max_ttl);
-        let ttl = Duration::from_secs(u64::from(ttl));
-        let refreshable = persistent && is_public_address_reply(&message);
-        let max_age = if refreshable { ttl + MAX_STALE_AGE } else { ttl };
-        if !ttl.is_zero() && age < max_age {
-            items.put(
-                key,
-                Entry {
-                    inserted: Instant::now(),
-                    ttl,
-                    age_at_insert: age,
-                    refreshable,
-                    message,
-                    persistent,
-                    restored,
-                    refreshing: false,
-                    retry_after: None,
-                },
-            );
-            if persistent && !restored {
-                self.dirty = true;
-            }
+        if let Some(entry) = self.disk.as_mut().and_then(|disk| disk.entries.peek_mut(key)) {
+            entry.age_at_insert = age;
         }
     }
 
@@ -242,9 +340,9 @@ impl Cache {
         let oversized = bytes.len() > max_bytes;
         bytes.truncate(max_bytes);
         let restored = self.restore_snapshot(&bytes, config, oversized, accepts)?;
-        if oversized {
-            self.dirty = true;
-            self.save(path, config.recursive, max_bytes)?;
+        if oversized && let Some(disk) = &mut self.disk {
+            disk.dirty = true;
+            self.save(path, config.recursive)?;
         }
         Ok(restored)
     }
@@ -283,7 +381,7 @@ impl Cache {
             return Ok(0);
         }
         let persistent = !legacy || config.cn_fallback.is_none();
-        let mut records = Vec::new();
+        let mut restored = 0;
         while !input.is_empty() {
             let Some(((key, bytes), age_at_snapshot)) = take_packet(&mut input)
                 .and_then(|key| take_packet(&mut input).map(|bytes| (key, bytes)))
@@ -294,70 +392,70 @@ impl Cache {
                 }
                 return Err(invalid_snapshot());
             };
-            if let (Ok(query), Ok(answer)) = (Message::from_vec(key), Message::from_vec(bytes)) {
-                if query.queries.len() == 1
-                    && answer.queries == query.queries
-                    && (legacy || accepts(&query, &answer))
-                    && let Some(key) = self.key(&query, key)
-                {
-                    let elapsed = Duration::from_secs(age + u64::from(age_at_snapshot));
-                    records.push((key.to_vec(), answer, elapsed));
+            let (Ok(query), Ok(answer)) = (Message::from_vec(key), Message::from_vec(bytes)) else {
+                continue;
+            };
+            if query.queries.len() != 1 || answer.queries != query.queries || (!legacy && !accepts(&query, &answer)) {
+                continue;
+            }
+            let Some(key) = self.key(&query, key) else { continue };
+            let elapsed = Duration::from_secs(age + u64::from(age_at_snapshot));
+            let Some(entry) = Entry::new(answer, self.max_ttl, persistent, elapsed, true) else {
+                continue;
+            };
+            if persistent && let Some(disk) = &mut self.disk {
+                if let Some(stored) = entry.disk_entry() && disk.insert(key.to_vec(), stored, true) {
+                    restored += 1;
                 }
+            } else if let Some(items) = &mut self.items && !items.contains(key) && items.len() < items.cap().get() {
+                items.put(key.to_vec(), entry);
+                restored += 1;
             }
         }
-        for (key, reply, elapsed) in records.into_iter().rev() {
-            self.put(key, reply, persistent, elapsed, true);
-        }
-        let restored = self.items.as_ref().map_or(0, LruCache::len);
-        if !stores_age && persistent && restored > 0 {
-            self.dirty = true;
+        if !stores_age && persistent && restored > 0 && let Some(disk) = &mut self.disk {
+            disk.dirty = true;
         }
         Ok(restored)
     }
 
-    pub fn save(&mut self, path: &Path, upstream: SocketAddr, max_bytes: usize) -> io::Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        let Some(items) = &self.items else {
-            return Ok(());
+    pub fn snapshot(&mut self, upstream: SocketAddr) -> io::Result<Option<Vec<u8>>> {
+        let Some(disk) = self.disk.as_mut().filter(|disk| disk.dirty) else {
+            return Ok(None);
         };
-        let mut data = Vec::new();
+        let upstream = upstream.to_string();
+        let mut data = Vec::with_capacity(disk.bytes + 18 + upstream.len());
         data.extend_from_slice(MAGIC);
-        append_packet(&mut data, upstream.to_string().as_bytes());
+        append_packet(&mut data, upstream.as_bytes());
         data.extend_from_slice(&unix_time()?.to_be_bytes());
-        for (key, entry) in items.iter() {
+        for (key, entry) in disk.entries.iter() {
             let elapsed = entry.age();
             let age = elapsed.as_secs() + u64::from(elapsed.subsec_nanos() > 0);
-            let max_age = if entry.refreshable { entry.ttl + MAX_STALE_AGE } else { entry.ttl };
-            if !entry.persistent || age >= max_age.as_secs() {
+            if age >= entry.max_age.as_secs() {
                 continue;
-            }
-            let mut reply = entry.message.clone();
-            let ttl = entry.ttl.as_secs() as u32;
-            for record in reply
-                .answers
-                .iter_mut()
-                .chain(&mut reply.authorities)
-                .chain(&mut reply.additionals)
-            {
-                record.ttl = record.ttl.min(ttl);
-            }
-            let Ok(reply) = reply.to_vec() else { continue };
-            if reply.len() > MAX_QUERY_SIZE {
-                continue;
-            }
-            if data.len() + key.len() + reply.len() + 10 > max_bytes {
-                break;
             }
             data.extend_from_slice(&((key.len() + 2) as u16).to_be_bytes());
             data.extend_from_slice(&[0, 0]);
             data.extend_from_slice(key);
-            append_packet(&mut data, &reply);
+            append_packet(&mut data, &entry.wire);
             data.extend_from_slice(&(age as u32).to_be_bytes());
         }
-        atomic_write(path, &data, true)?;
-        self.dirty = false;
+        disk.dirty = false;
+        Ok(Some(data))
+    }
+
+    pub fn retry_save(&mut self) {
+        if let Some(disk) = &mut self.disk {
+            disk.dirty = true;
+        }
+    }
+
+    pub fn save(&mut self, path: &Path, upstream: SocketAddr) -> io::Result<()> {
+        if let Some(data) = self.snapshot(upstream)?
+            && let Err(err) = atomic_write(path, &data, true)
+        {
+            self.retry_save();
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -365,6 +463,10 @@ impl Cache {
 const LEGACY_MAGIC: &[u8; 8] = b"PPDNS001";
 const PREVIOUS_MAGIC: &[u8; 8] = b"PPDNS002";
 const MAGIC: &[u8; 8] = b"PPDNS003";
+
+fn records(message: &Message) -> impl Iterator<Item = &hickory_proto::rr::Record> {
+    message.answers.iter().chain(&message.authorities).chain(&message.additionals)
+}
 
 pub(crate) fn legacy_policy_stamp(config: &Config) -> u64 {
     let mut hash = DefaultHasher::new();

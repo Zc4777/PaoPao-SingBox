@@ -3,7 +3,7 @@
     "description": "Manage the PaoPaoDNS-RS service and its rule files",
     "read": {
       "uci": [ "paopaodns-rs" ],
-      "ubus": { "luci.paopaodns": [ "status", "readRule", "readLogs" ], "luci.paopaodns.proxy": [ "readLogs", "status" ] }
+      "ubus": { "luci.paopaodns": [ "status", "readRule", "readLogs" ], "luci.paopaodns.proxy": [ "readLogs", "status", "trafficHistory" ] }
     },
     "write": {
       "uci": [ "paopaodns-rs" ],

@@ -3,9 +3,6 @@
 'require view';
 'require rpc';
 
-const status = rpc.declare({
-    object: 'luci.paopaodns.proxy', method: 'status', expect: { '': {} }
-});
 const readConfig = rpc.declare({
     object: 'luci.paopaodns.proxy', method: 'readConfig', expect: { '': {} }
 });
@@ -19,15 +16,13 @@ return view.extend({
     handleReset: null,
 
     load: function() {
-        return L.hasViewPermission() ? Promise.all([status(), readConfig()]) : null;
+        return L.hasViewPermission() ? readConfig() : null;
     },
 
-    render: function(data) {
+    render: function(config) {
         const heading = E('h2', {}, [ '代理编辑器' ]);
-        if (!data)
+        if (!config)
             return E('section', { class: 'cbi-section' }, [ heading, E('p', {}, [ '查看配置需要代理管理权限。' ]) ]);
-        const [service, config] = data;
-        const state = E('span', {}, [ service.running ? '已运行' : '未运行' ]);
         const message = E('p', { role: 'status', style: 'white-space:pre-wrap;overflow-wrap:anywhere' },
             config.ok ? [] : [config.error || '读取配置失败']);
         const input = E('textarea', {
@@ -44,7 +39,6 @@ return view.extend({
                 try {
                     const reply = await writeConfig(input.value);
                     message.textContent = reply.ok ? '代理配置已保存并生效。' : (reply.error || '配置应用失败。');
-                    state.textContent = (await status()).running ? '已运行' : '未运行';
                 } catch (error) {
                     message.textContent = error.message;
                 } finally {
@@ -55,7 +49,6 @@ return view.extend({
         save.disabled = !config.ok;
         return E('section', { class: 'cbi-section' }, [
             heading,
-            E('p', {}, [ 'sing-box · ', state ]),
             input,
             E('div', { class: 'control-group', style: 'margin-top:.75rem' }, [ save ]),
             message

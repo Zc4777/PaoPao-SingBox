@@ -284,10 +284,10 @@ fn persistent_cache_respects_ttl_and_policy() {
         upstream: None,
     };
     let config = Config::parse_from(["test"]);
-    let mut cache = Cache::new(16, 8);
+    let mut cache = Cache::new(16, 8).with_disk(4096, config.recursive);
     let key = cache.key(&query, &query_wire).unwrap();
     cache.insert(key, &answer, true);
-    cache.save(&path, config.recursive, 4096).unwrap();
+    cache.save(&path, config.recursive).unwrap();
 
     let mut miss = Cache::new(16, 8);
     let changed_upstream = Config::parse_from(["test", "--recursive", "127.0.0.1:53"]);
@@ -298,7 +298,7 @@ fn persistent_cache_respects_ttl_and_policy() {
     let saved = u64::from_be_bytes(data[saved_at.clone()].try_into().unwrap());
     data[saved_at.clone()].copy_from_slice(&(saved - 3).to_be_bytes());
     std::fs::write(&path, &data).unwrap();
-    let mut restored = Cache::new(16, 8);
+    let mut restored = Cache::new(16, 8).with_disk(4096, config.recursive);
     assert_eq!(restored.restore(&path, &config, 4096, |_, _| true).unwrap(), 1);
     let hit = restored.get(key, 22, true).unwrap();
     assert_eq!(hit.source, "disk-cache");
@@ -309,10 +309,10 @@ fn persistent_cache_respects_ttl_and_policy() {
     // Save an already expired record and verify its age survives a restart.
     cache.insert(key, &answer, true);
     cache.set_entry_age(key, Duration::from_secs(20));
-    cache.save(&path, config.recursive, 4096).unwrap();
+    cache.save(&path, config.recursive).unwrap();
     let mut data = std::fs::read(&path).unwrap();
     let saved = u64::from_be_bytes(data[saved_at.clone()].try_into().unwrap());
-    let mut optimistic = Cache::new(16, 8);
+    let mut optimistic = Cache::new(16, 8).with_disk(4096, config.recursive);
     assert_eq!(optimistic.restore(&path, &config, 4096, |_, _| true).unwrap(), 1);
     assert!(optimistic.get(key, 22, false).is_none());
     let hit = optimistic.get(key, 22, true).unwrap();
@@ -360,9 +360,9 @@ fn legacy_cache_migrates_and_rule_changes_only_discard_affected_entries() {
     }
 
     std::fs::write(&path, &legacy).unwrap();
-    let mut migrated = Cache::new(16, 600);
+    let mut migrated = Cache::new(16, 600).with_disk(4096, config.recursive);
     assert_eq!(migrated.restore(&path, &config, 4096, |q, a| can_restore_recursive(&config, &rules, q, a)).unwrap(), 2);
-    migrated.save(&path, config.recursive, 4096).unwrap();
+    migrated.save(&path, config.recursive).unwrap();
     assert!(std::fs::read(&path).unwrap().starts_with(b"PPDNS003"));
 
     let rule_file = directory.join("force_forward_list.txt");
@@ -372,7 +372,7 @@ fn legacy_cache_migrates_and_rule_changes_only_discard_affected_entries() {
         "--custom-forward", "127.0.0.1:1020", "--encrypted", "127.0.0.1:5304",
     ]);
     let new_rules = Rules::load(&new_config).unwrap();
-    let mut restored = Cache::new(16, 600);
+    let mut restored = Cache::new(16, 600).with_disk(4096, new_config.recursive);
     assert_eq!(restored.restore(&path, &new_config, 4096, |q, a| can_restore_recursive(&new_config, &new_rules, q, a)).unwrap(), 1);
 
     for (domain, hit) in [("keep.example.", true), ("changed.example.", false)] {
@@ -384,6 +384,44 @@ fn legacy_cache_migrates_and_rule_changes_only_discard_affected_entries() {
     std::fs::remove_file(rule_file).unwrap();
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn persistent_cache_survives_hot_eviction_and_honors_byte_limit() {
+    let path = std::env::temp_dir().join(format!("paopaodns-large-cache-{}.bin", std::process::id()));
+    let config = Config::parse_from(["test"]);
+    let budget = 1024 * 1024;
+    let mut cache = Cache::new(1024, 600).with_disk(budget, config.recursive);
+    let mut small_cache = Cache::new(2, 600).with_disk(4096, config.recursive);
+    for i in 0..1500 {
+        let packet = request(&format!("record-{i}.example."), RecordType::A, 1);
+        let query = Message::from_vec(&packet).unwrap();
+        let mut response = dns::response(&query, ResponseCode::NoError);
+        response.answers.push(Record::from_rdata(
+            query.queries[0].name.clone(),
+            600,
+            hickory_proto::rr::RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+        let answer = Answer { bytes: response.to_vec().unwrap(), message: response, upstream: None };
+        let key = cache.key(&query, &packet).unwrap();
+        cache.insert(key, &answer, true);
+        small_cache.insert(key, &answer, true);
+    }
+    let early = request("record-0.example.", RecordType::A, 2);
+    let latest = request("record-1499.example.", RecordType::A, 2);
+    assert_eq!(cache.get(&early[2..], 2, false).unwrap().source, "disk-cache");
+    assert!(small_cache.get(&early[2..], 2, false).is_none());
+    assert!(small_cache.get(&latest[2..], 2, false).is_some());
+    assert!(small_cache.snapshot(config.recursive).unwrap().unwrap().len() <= 4096);
+
+    cache.save(&path, config.recursive).unwrap();
+    let mut restored = Cache::new(2, 600).with_disk(budget, config.recursive);
+    assert_eq!(restored.restore(&path, &config, budget, |_, _| true).unwrap(), 1500);
+    assert!(restored.get(&early[2..], 2, false).is_some());
+    restored.invalidate(&early[2..]);
+    assert!(restored.get(&early[2..], 2, false).is_none());
+    assert!(restored.get(&latest[2..], 2, false).is_some());
+    std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]
